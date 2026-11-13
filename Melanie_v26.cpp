@@ -1,0 +1,2347 @@
+// puzzle_pur.cpp — implémentation pure, sans dépendance externe
+// Compilation : g++ -O3 -march=native -std=c++17 -o puzzle_pur puzzle_pur.cpp -pthread
+//
+// Version 2 : moteur arithmétique et de hachage entièrement reconstruit en s'inspirant de
+// l'architecture d'un moteur de recherche multi-cibles beaucoup plus rapide :
+//   - Big (limbes variables, capacité 10x64 bits) -> U256 (4 limbes FIXES, pas de boucle sur n)
+//     et réduction de Solinas dédiée à p = 2^256 - 2^32 - 977 (plus rapide que la boucle générique).
+//   - Carré dédié (fe_sqr, ~10 multiplications 64x64 au lieu de 16 pour fe_mul).
+//   - Inversion modulaire par chaîne d'addition fixe (fe_inv), au lieu d'un modpow générique
+//     bit à bit sur l'exposant p-2 (même coût arithmétique mais sans le surcoût de boucle/branche).
+//   - La marche sur la courbe n'avance plus clé par clé en Jacobien (walk_points) : elle utilise
+//     désormais la technique "fenêtre centrée ±i" : un point central C sert à DEUX clés (C-i et
+//     C+i) pour le prix d'une seule inversion partagée entre les 2*HALF clés du lot (HALF=512),
+//     via un polynôme d'inversion par lot (même principe que Montgomery, mais réutilisé pour
+//     économiser une inversion sur deux par rapport à l'ancienne méthode).
+//   - hash160 calculé par paquets de 8 clés à la fois en SIMD (registres vectoriels GCC/Clang),
+//     au lieu d'un hash160 par clé : c'était le second goulot d'étranglement après les inversions.
+// Le format de sortie, les options de ligne de commande, le mode voisinage (-v/-vv/-vvv/-vvvv) et
+// sont inchangés. La reprise de session a été retirée en version 4 (voir plus bas).
+//
+// Version 3 : polissage du mode voisinage et nettoyage général.
+//   - Mode voisinage : affichage unifié avec le mode normal (une seule ligne mise à jour sur
+//     place, compteur de clés/vitesse cumulatif sur toute la session, plus de spam par essai).
+//   - Pool de threads persistant pour le mode voisinage (ThreadPool) : les threads ne sont plus
+//     recréés à chaque segment, ce qui élimine le principal goulot d'étranglement sur les petits
+//     segments (quelques bits, scannés en quelques microsecondes).
+//   - Affichage console protégé par un mutex (g_print_mtx) : plus d'entrelacement possible entre
+//     la ligne de progression et le message "CLE TROUVEE".
+//   - Sérialisation d'un point en clé publique compressée factorisée dans point_to_compressed()/
+//     x_to_bytes() au lieu d'être dupliquée à quatre endroits du fichier.
+//   - Nettoyage : suppression de code mort (P_minus, (void)ref_key).
+//
+// Version 4 : suppression du fichier de reprise de session (mode normal).
+//   - Plus de lecture/écriture de reprise_<adresse>_<bits>.txt : chaque lancement scanne la
+//     plage depuis le début, sans état persistant entre deux exécutions.
+//
+// Version 5 : arrêt propre par Ctrl-C et vitesse du mode voisinage alignée sur le mode normal.
+//   - Ctrl-C (SIGINT) / SIGTERM : le thread principal ne reste plus endormi jusqu'à la fin de
+//     l'intervalle d'affichage (-s, 30 s par défaut) avant de s'arrêter ; il vérifie désormais
+//     l'arrêt demandé toutes les 50 ms. Un message est affiché dès le premier Ctrl-C, et un
+//     second Ctrl-C force une sortie immédiate si l'arrêt propre ne suffisait pas.
+//   - Mode voisinage : la table de fenêtre (WinTable) de chaque segment est désormais construite
+//     une seule fois avant la boucle de tentatives, au lieu d'être reconstruite à chaque tirage
+//     (tirage aléatoire) (coût quasi équivalent à un passage de scan_batch complet, payé inutilement à chaque
+//     tentative).
+//   - Mode voisinage : parallélisme par TENTATIVE plutôt que par bloc à l'intérieur d'une
+//     tentative (suppression de scan_segment/ThreadPool). L'ancien modèle répartissait les clés
+//     d'UN SEUL segment entre les threads via des blocs ; pour un segment de voisinage typique
+//     (quelques bits à quelques dizaines de bits, souvent < 2*HALF=1024 clés), il n'existait
+//     qu'un seul bloc possible, donc un seul thread travaillait pendant que tous les autres
+//     restaient inactifs (ex: -v3 avec 8 threads -> 7 threads inutilisés). Chaque thread
+//     (neighbor_worker) traite désormais sa propre tentative indépendante de bout en bout, comme
+//     le fait déjà le mode normal : tous les cœurs restent occupés quelle que soit la taille des
+//     segments.
+//
+// Version 8 : le mode voisinage visite désormais les zones dans un ordre ALÉATOIRE SANS DOUBLON
+//   (au lieu de tirages avec remise) : chaque « cellule » (motif des bits hors segment) est
+//   scannée une seule fois, dans un ordre pseudo-aléatoire (permutation de Feistel à clés tirées à
+//   chaque lancement). Le programme connaît donc exactement ce qui est déjà scanné : affichage
+//   « essai X/Y | pourcentage | ETA » et message « Plage entièrement scannée » en fin de plage,
+//   comme le mode normal. Plus aucun verrou ni générateur aléatoire pendant la recherche.
+//
+// Version 7 : suppression complète de la suite de Sobol (struct Sobol1D, option -sobol, verrou
+//   g_sobol_mtx). Le mode voisinage tire désormais ses clés de référence de façon purement
+//   probabiliste : tirages uniformes INDÉPENDANTS (avec remise) dans [0, span), via un générateur
+//   mt19937_64 PROPRE À CHAQUE THREAD, graine issue de std::random_device. Plus aucun verrou
+//   partagé pendant le tirage ; le mode normal (permutation aléatoire sans doublon) est inchangé.
+//
+// Version 6 : recherche de PLUSIEURS puzzles en un seul balayage (-pApB).
+//   - Nouvel argument  -pApB  (ex : -p66p70) : cible TOUS les puzzles de A à B inclus. L'intervalle
+//     parcouru est l'enveloppe commune : borne inférieure du plus petit puzzle (2^(A-1)) jusqu'à la
+//     borne supérieure du plus grand (2^B - 1). Chaque clé générée n'est calculée qu'UNE fois et
+//     comparée à toutes les cibles : chercher 5 puzzles coûte le même temps que chercher le plus grand.
+//   - -pP seul (un puzzle) reste valable ; plusieurs arguments -p peuvent être combinés
+//     (ex : -p66 -p70p72) : cibles = union des puzzles choisis, intervalle = du plus petit au plus grand.
+//   - TargetSet : ensemble de cibles hash160 avec filtre binaire de 65536 bits (8 Ko, cache L1) :
+//     coût par clé quasi identique à une cible unique, même avec 80 cibles.
+//   - La recherche NE S'ARRÊTE PLUS à la première clé trouvée : elle continue jusqu'à ce que toutes
+//     les cibles soient trouvées (ou plage épuisée / Ctrl-C). Chaque clé est enregistrée dans God.txt
+//     avec son numéro de puzzle, et l'affichage indique « trouvées X/N ».
+//   - scan_batch rappelle désormais un callback à CHAQUE correspondance (au lieu de s'arrêter à la
+//     première), ce qui est indispensable en multi-cibles.
+//   - Correctif : l'auto-test n'ajoute plus 8192 clés fictives au compteur du mode normal.
+//
+// Version 9 : moteur GPU (CUDA) pour le mode normal (non voisinage), multi-GPU.
+//   - Compilation inchangée avec g++ (voir ligne de commande ci-dessus) : programme 100% CPU,
+//     identique en tout point aux versions précédentes.
+//   - Compilation avec nvcc (voir ligne ci-dessous) : ajoute un chemin GPU utilisé automatiquement
+//     quand au moins un GPU CUDA est détecté (désactivable avec --cpu, forçable avec --gpu).
+//     L'arithmétique de corps fini, les points de courbe, la table de base fixe, la technique de
+//     fenêtre ±i (batch d'inversion) et le hash160 sont réimplémentés comme fonctions __device__,
+//     en reproduisant très directement la logique déjà testée des fonctions CPU correspondantes
+//     (mêmes formules, même structure), avec une fenêtre plus petite par thread (HALF_GPU, voir
+//     plus bas) adaptée à la mémoire locale limitée d'un thread CUDA. Chaque chunk (au sens des
+//     fonctions claim/worker déjà existantes) est traité par UN thread GPU indépendant ; les deux
+//     GPU Kaggle T4 se partagent dynamiquement les chunks via claim_range() (verrou partagé,
+//     identique en esprit à claim()). Chaque correspondance potentielle trouvée sur GPU est
+//     revérifiée sur CPU par la fonction verify_key() déjà existante avant d'être enregistrée :
+//     un bug de portage GPU peut donc au pire faire manquer une clé, jamais en inventer une fausse.
+//     Un auto-test GPU dédié (gpu_run_self_test) tourne une fois par GPU avant toute recherche
+//     réelle ; un GPU dont l'auto-test échoue est simplement ignoré (le CPU ou l'autre GPU
+//     prennent le relais).
+//
+// Version 10 : le mode voisinage (-v/-vv/-vvv/-vvvv) utilise désormais lui aussi le(s) GPU par
+//   défaut s'ils sont détectés et validés (gpu_neighbor_worker) : c'est EXACTEMENT le même moteur
+//   de scan que le mode normal (GpuJob/GpuHit/gpu_scan_kernel, non modifiés), seule la table de
+//   fenêtre change — multiples de 2^start_bit * G au lieu de multiples de G, puisqu'un segment de
+//   voisinage de N bits avance par pas de 2^start_bit (voir build_gpu_win_host). L'auto-test GPU
+//   vérifie désormais aussi ce cas (pas « grand », type segment) en plus du cas normal (pas = G).
+//   Compilation CPU (inchangée)   : g++ -O3 -march=native -std=c++17 -o puzzle_pur puzzle_pur.cpp -pthread
+//   Compilation GPU (Kaggle, 2x T4, Turing = sm_75) :
+//     nvcc -O3 -std=c++17 -arch=sm_75 -Xcompiler -O3,-march=native,-pthread -o puzzle_gpu puzzle_gpu.cu
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+#endif
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <utility>
+#include <fstream>
+#include <iostream>
+#include <mutex>
+#include <random>
+#include <string>
+#include <thread>
+#include <unistd.h>
+#include <vector>
+
+typedef uint64_t u64;
+typedef uint32_t u32;
+typedef unsigned __int128 u128;
+
+// =================== U256 : entier 256 bits à 4 limbes FIXES ===================
+struct U256 { u64 d[4]; };
+static const U256 ZERO = {{0,0,0,0}};
+static const U256 ONE  = {{1,0,0,0}};
+static const u64  KC = 0x1000003D1ULL; // 2^256 mod p (p = 2^256 - 2^32 - 977)
+
+static inline bool is_zero(const U256 &a) { return (a.d[0]|a.d[1]|a.d[2]|a.d[3]) == 0; }
+static inline bool eq(const U256 &a, const U256 &b) {
+    return ((a.d[0]^b.d[0])|(a.d[1]^b.d[1])|(a.d[2]^b.d[2])|(a.d[3]^b.d[3])) == 0;
+}
+static inline u64 add_raw(U256 &r, const U256 &a, const U256 &b) {
+    u128 acc = 0; u64 c = 0;
+    for (int i = 0; i < 4; i++) { acc = (u128)a.d[i] + b.d[i] + c; r.d[i] = (u64)acc; c = (u64)(acc >> 64); }
+    return c;
+}
+static inline u64 sub_raw(U256 &r, const U256 &a, const U256 &b) {
+    u64 br = 0;
+    for (int i = 0; i < 4; i++) {
+        u128 t = (u128)a.d[i] - b.d[i] - br;
+        r.d[i] = (u64)t; br = (u64)((t >> 64) & 1);
+    }
+    return br;
+}
+static int highest_bit(const U256 &a) {
+    for (int i = 255; i >= 0; --i) if ((a.d[i >> 6] >> (i & 63)) & 1) return i;
+    return -1;
+}
+static inline int get_bit(const U256 &a, int i) { return (int)((a.d[i >> 6] >> (i & 63)) & 1); }
+
+static bool parse_hex(const std::string &s, U256 &out) {
+    if (s.empty() || s.size() > 64) return false;
+    out = ZERO;
+    for (size_t i = 0; i < s.size(); i++) {
+        char c = s[s.size() - 1 - i]; int v;
+        if (c >= '0' && c <= '9') v = c - '0'; else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10; else return false;
+        out.d[i / 16] |= (u64)v << ((i % 16) * 4);
+    }
+    return true;
+}
+static U256 u128_to_U256(u128 v) { U256 r; r.d[0] = (u64)v; r.d[1] = (u64)(v >> 64); r.d[2] = 0; r.d[3] = 0; return r; }
+
+// =================== Corps fini Fp (secp256k1) ===================
+static inline void fe_add(U256 &r, const U256 &a, const U256 &b) {
+    U256 t; u64 c = add_raw(t, a, b);
+    if (c) { U256 k = {{KC,0,0,0}}; add_raw(t, t, k); }
+    // t >= p ? soustraire p — comparaison directe plutôt que de stocker p entier à part
+    static const U256 P = {{0xFFFFFFFEFFFFFC2FULL, ~0ULL, ~0ULL, ~0ULL}};
+    bool geq = true;
+    for (int i = 3; i >= 0 && geq; --i) if (t.d[i] != P.d[i]) { geq = t.d[i] > P.d[i]; break; }
+    if (geq) sub_raw(t, t, P);
+    r = t;
+}
+static inline void fe_sub(U256 &r, const U256 &a, const U256 &b) {
+    U256 t; u64 br = sub_raw(t, a, b);
+    if (br) { U256 k = {{KC,0,0,0}}; sub_raw(t, t, k); }
+    r = t;
+}
+static inline void fe_reduce(U256 &r, const u64 *t) {
+    u64 r5[5]; u64 carry = 0;
+    for (int i = 0; i < 4; i++) { u128 acc = (u128)t[4+i]*KC + t[i] + carry; r5[i] = (u64)acc; carry = (u64)(acc>>64); }
+    r5[4] = carry;
+    U256 res; u128 acc = (u128)r5[4]*KC + r5[0];
+    res.d[0] = (u64)acc; carry = (u64)(acc>>64);
+    for (int i = 1; i < 4; i++) { acc = (u128)r5[i]+carry; res.d[i]=(u64)acc; carry=(u64)(acc>>64); }
+    if (carry) {
+        acc = (u128)res.d[0]+KC; res.d[0]=(u64)acc; carry=(u64)(acc>>64);
+        for (int i = 1; i < 4; i++) { acc=(u128)res.d[i]+carry; res.d[i]=(u64)acc; carry=(u64)(acc>>64); }
+    }
+    static const U256 P = {{0xFFFFFFFEFFFFFC2FULL, ~0ULL, ~0ULL, ~0ULL}};
+    bool geq = true;
+    for (int i = 3; i >= 0; --i) if (res.d[i] != P.d[i]) { geq = res.d[i] > P.d[i]; break; }
+    if (geq) sub_raw(res, res, P);
+    r = res;
+}
+static inline void fe_mul(U256 &r, const U256 &a, const U256 &b) {
+    u64 t[8] = {0,0,0,0,0,0,0,0};
+    for (int i = 0; i < 4; i++) {
+        u64 carry = 0;
+        for (int j = 0; j < 4; j++) { u128 acc=(u128)a.d[i]*b.d[j]+t[i+j]+carry; t[i+j]=(u64)acc; carry=(u64)(acc>>64); }
+        t[i+4] = carry;
+    }
+    fe_reduce(r, t);
+}
+static inline void fe_sqr(U256 &r, const U256 &a) { // carré dédié : 10 produits au lieu de 16
+    u64 t[8] = {0,0,0,0,0,0,0,0};
+    for (int i = 0; i < 3; i++) {
+        u64 carry = 0;
+        for (int j = i+1; j < 4; j++) { u128 acc=(u128)a.d[i]*a.d[j]+t[i+j]+carry; t[i+j]=(u64)acc; carry=(u64)(acc>>64); }
+        t[i+4] = carry;
+    }
+    u64 c = 0;
+    for (int k = 0; k < 8; k++) { u64 v=t[k]; t[k]=(v<<1)|c; c=v>>63; }
+    u64 carry = 0;
+    for (int i = 0; i < 4; i++) {
+        u128 acc=(u128)a.d[i]*a.d[i]+t[2*i]+carry; t[2*i]=(u64)acc; carry=(u64)(acc>>64);
+        acc=(u128)t[2*i+1]+carry; t[2*i+1]=(u64)acc; carry=(u64)(acc>>64);
+    }
+    fe_reduce(r, t);
+}
+static inline void fe_sqr_n(U256 &r, const U256 &a, int n) { U256 t=a; for(int i=0;i<n;i++) fe_sqr(t,t); r=t; }
+// Inversion par chaîne d'addition fixe (équivalent à a^(p-2) mod p, 255 carrés + 14 produits)
+static U256 fe_inv(const U256 &a) {
+    U256 x2,x3,x6,x9,x11,x22,x44,x88,x176,x220,x223,t;
+    fe_sqr(x2,a); fe_mul(x2,x2,a);
+    fe_sqr(x3,x2); fe_mul(x3,x3,a);
+    fe_sqr_n(x6,x3,3); fe_mul(x6,x6,x3);
+    fe_sqr_n(x9,x6,3); fe_mul(x9,x9,x3);
+    fe_sqr_n(x11,x9,2); fe_mul(x11,x11,x2);
+    fe_sqr_n(x22,x11,11); fe_mul(x22,x22,x11);
+    fe_sqr_n(x44,x22,22); fe_mul(x44,x44,x22);
+    fe_sqr_n(x88,x44,44); fe_mul(x88,x88,x44);
+    fe_sqr_n(x176,x88,88); fe_mul(x176,x176,x88);
+    fe_sqr_n(x220,x176,44); fe_mul(x220,x220,x44);
+    fe_sqr_n(x223,x220,3); fe_mul(x223,x223,x3);
+    fe_sqr_n(t,x223,23); fe_mul(t,t,x22);
+    fe_sqr_n(t,t,5); fe_mul(t,t,a);
+    fe_sqr_n(t,t,3); fe_mul(t,t,x2);
+    fe_sqr_n(t,t,2); fe_mul(t,t,a);
+    return t;
+}
+
+// =================== Courbe secp256k1 (y^2 = x^3 + 7) ===================
+struct Point { U256 x, y; bool inf = false; };
+struct Jac { U256 X, Y, Z; bool inf = false; };
+
+static Point G;
+
+static Point aff_add(const Point &P, const Point &Q) {
+    if (P.inf) return Q;
+    if (Q.inf) return P;
+    U256 l;
+    if (eq(P.x, Q.x)) {
+        if (!eq(P.y, Q.y) || is_zero(P.y)) return Point{ZERO, ZERO, true};
+        U256 n, d, n3; fe_sqr(n, P.x); fe_add(n3, n, n); fe_add(n3, n3, n);
+        fe_add(d, P.y, P.y); fe_mul(l, n3, fe_inv(d));
+    } else {
+        U256 n, d; fe_sub(n, Q.y, P.y); fe_sub(d, Q.x, P.x); fe_mul(l, n, fe_inv(d));
+    }
+    Point R; R.inf = false;
+    fe_sqr(R.x, l); fe_sub(R.x, R.x, P.x); fe_sub(R.x, R.x, Q.x);
+    U256 t; fe_sub(t, P.x, R.x); fe_mul(R.y, l, t); fe_sub(R.y, R.y, P.y);
+    return R;
+}
+static Jac jac_dbl(const Jac &P) {
+    if (P.inf || is_zero(P.Y)) return Jac{ZERO, ZERO, ZERO, true};
+    U256 A,B,C,D,E,F,t,t2;
+    fe_sqr(A,P.X); fe_sqr(B,P.Y); fe_sqr(C,B);
+    fe_add(t,P.X,B); fe_sqr(t,t); fe_sub(t,t,A); fe_sub(t,t,C); fe_add(D,t,t);
+    fe_add(E,A,A); fe_add(E,E,A); fe_sqr(F,E);
+    Jac R; R.inf=false;
+    fe_add(t,D,D); fe_sub(R.X,F,t);
+    fe_sub(t,D,R.X); fe_mul(t,E,t);
+    fe_add(t2,C,C); fe_add(t2,t2,t2); fe_add(t2,t2,t2);
+    fe_sub(R.Y,t,t2);
+    fe_mul(t,P.Y,P.Z); fe_add(R.Z,t,t);
+    return R;
+}
+static Jac jac_madd(const Jac &P, const Point &Q) {
+    if (P.inf) { Jac R; R.X=Q.x; R.Y=Q.y; R.Z=ONE; R.inf=false; return R; }
+    U256 Z1Z1,U2,S2,H,HH,I,J,r,V,t;
+    fe_sqr(Z1Z1,P.Z); fe_mul(U2,Q.x,Z1Z1);
+    fe_mul(S2,Q.y,P.Z); fe_mul(S2,S2,Z1Z1);
+    fe_sub(H,U2,P.X);
+    fe_sub(t,S2,P.Y); fe_add(r,t,t);
+    if (is_zero(H)) { if (is_zero(r)) return jac_dbl(P); return Jac{ZERO,ZERO,ZERO,true}; }
+    fe_sqr(HH,H); fe_add(I,HH,HH); fe_add(I,I,I);
+    fe_mul(J,H,I); fe_mul(V,P.X,I);
+    Jac R; R.inf=false;
+    fe_sqr(R.X,r); fe_sub(R.X,R.X,J); fe_sub(R.X,R.X,V); fe_sub(R.X,R.X,V);
+    fe_sub(t,V,R.X); fe_mul(t,r,t);
+    U256 u; fe_mul(u,P.Y,J); fe_add(u,u,u);
+    fe_sub(R.Y,t,u);
+    fe_add(t,P.Z,H); fe_sqr(t,t); fe_sub(t,t,Z1Z1); fe_sub(R.Z,t,HH);
+    return R;
+}
+static Jac jac_mul(const U256 &k, const Point &P) {
+    Jac R; R.X=R.Y=R.Z=ZERO; R.inf=true;
+    for (int i = highest_bit(k); i >= 0; --i) { R = jac_dbl(R); if (get_bit(k,i)) R = jac_madd(R,P); }
+    return R;
+}
+static Point jac_to_aff(const Jac &J) {
+    Point A; A.x=ZERO; A.y=ZERO;
+    if (J.inf) { A.inf=true; return A; }
+    U256 zi=fe_inv(J.Z), zi2, zi3;
+    fe_sqr(zi2,zi); fe_mul(zi3,zi2,zi);
+    fe_mul(A.x,J.X,zi2); fe_mul(A.y,J.Y,zi3); A.inf=false;
+    return A;
+}
+
+// =================== Table de multiplication à base fixe (calcul rapide de k*G) ===================
+// 16 fenêtres de 8 bits ; chaque fenêtre contient les 255 multiples non nuls de 2^(8w)*G.
+// Construite une seule fois au démarrage (4080 additions affines, ~20 ms) ; scalar_mul_fixed
+// combine ensuite au plus 16 points par addition Jacobienne mixte (une seule inversion finale).
+static const int GT_W = 8, GT_BITS = 128, GT_WINDOWS = GT_BITS / GT_W, GT_SIZE = 1 << GT_W;
+static std::vector<Point> g_gtable;
+
+static void init_gtable(const Point &g) {
+    g_gtable.assign((size_t)GT_WINDOWS * GT_SIZE, Point{ZERO, ZERO, true});
+    Point base = g;
+    for (int w = 0; w < GT_WINDOWS; w++) {
+        Point cur = base;
+        g_gtable[(size_t)w*GT_SIZE + 1] = cur;
+        for (int d = 2; d < GT_SIZE; d++) { cur = aff_add(cur, base); g_gtable[(size_t)w*GT_SIZE + d] = cur; }
+        base = aff_add(cur, base); // 256 * base précédente
+    }
+}
+static Point scalar_mul_fixed(const U256 &k) {
+    Jac acc; acc.X=acc.Y=acc.Z=ZERO; acc.inf=true;
+    for (int w = 0; w < GT_WINDOWS; w++) {
+        int pos = w * GT_W, limb = pos / 64;
+        if (limb >= 4) break;
+        unsigned d = (unsigned)((k.d[limb] >> (pos % 64)) & (GT_SIZE - 1));
+        if (d) acc = jac_madd(acc, g_gtable[(size_t)w*GT_SIZE + d]);
+    }
+    return jac_to_aff(acc);
+}
+
+// =================== SHA-256 (un seul bloc, messages <= 55 octets) ===================
+static inline u32 rotr32(u32 x,int n){ return (x>>n)|(x<<(32-n)); }
+static inline u32 rotl32(u32 x,int n){ return (x<<n)|(x>>(32-n)); }
+static const u32 SHA_K[64] = {
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+static inline void sha256_block(const u32* w16, u32* out) {
+    u32 w[64];
+    for (int i=0;i<16;i++) w[i]=w16[i];
+    for (int i=16;i<64;i++) {
+        u32 s0=rotr32(w[i-15],7)^rotr32(w[i-15],18)^(w[i-15]>>3);
+        u32 s1=rotr32(w[i-2],17)^rotr32(w[i-2],19)^(w[i-2]>>10);
+        w[i]=w[i-16]+s0+w[i-7]+s1;
+    }
+    u32 a=0x6a09e667,b=0xbb67ae85,c=0x3c6ef372,d=0xa54ff53a,e=0x510e527f,f=0x9b05688c,g=0x1f83d9ab,h=0x5be0cd19;
+    for (int i=0;i<64;i++) {
+        u32 S1=rotr32(e,6)^rotr32(e,11)^rotr32(e,25), ch=(e&f)^(~e&g);
+        u32 t1=h+S1+ch+SHA_K[i]+w[i];
+        u32 S0=rotr32(a,2)^rotr32(a,13)^rotr32(a,22), mj=(a&b)^(a&c)^(b&c);
+        u32 t2=S0+mj;
+        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    out[0]=a+0x6a09e667; out[1]=b+0xbb67ae85; out[2]=c+0x3c6ef372; out[3]=d+0xa54ff53a;
+    out[4]=e+0x510e527f; out[5]=f+0x9b05688c; out[6]=g+0x1f83d9ab; out[7]=h+0x5be0cd19;
+}
+static void sha256_bytes(const unsigned char* m, size_t n, unsigned char* out32) {
+    unsigned char buf[64]; memset(buf,0,64); memcpy(buf,m,n); buf[n]=0x80;
+    u64 bl=(u64)n*8; for (int i=0;i<8;i++) buf[63-i]=(unsigned char)(bl>>(8*i));
+    u32 w[16],o[8];
+    for (int i=0;i<16;i++) w[i]=((u32)buf[4*i]<<24)|((u32)buf[4*i+1]<<16)|((u32)buf[4*i+2]<<8)|buf[4*i+3];
+    sha256_block(w,o);
+    for (int i=0;i<8;i++){ out32[4*i]=o[i]>>24; out32[4*i+1]=o[i]>>16; out32[4*i+2]=o[i]>>8; out32[4*i+3]=o[i]; }
+}
+static void sha256d(const unsigned char* d, size_t n, unsigned char out[32]) {
+    unsigned char t[32]; sha256_bytes(d,n,t); sha256_bytes(t,32,out);
+}
+
+// =================== RIPEMD-160 (un seul bloc, scalaire) ===================
+static const unsigned char RMD_R1[80]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15, 7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
+    3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12, 1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2, 4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13};
+static const unsigned char RMD_R2[80]={5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12, 6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
+    15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13, 8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14, 12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11};
+static const unsigned char RMD_S1[80]={11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8, 7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,
+    11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5, 11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12, 9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6};
+static const unsigned char RMD_S2[80]={8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6, 9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,
+    9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5, 15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8, 8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11};
+static const u32 RMD_K1[5]={0x00000000,0x5A827999,0x6ED9EBA1,0x8F1BBCDC,0xA953FD4E};
+static const u32 RMD_K2[5]={0x50A28BE6,0x5C4DD124,0x6D703EF3,0x7A6D76E9,0x00000000};
+template<int F> static inline u32 rmd_f(u32 x,u32 y,u32 z){
+    if(F==0) return x^y^z;
+    if(F==1) return (x&y)|(~x&z);
+    if(F==2) return (x|~y)^z;
+    if(F==3) return (x&z)|(y&~z);
+    return x^(y|~z);
+}
+static inline void rmd160_block(const u32* X, u32* out) {
+    u32 a=0x67452301,b=0xEFCDAB89,c=0x98BADCFE,d=0x10325476,e=0xC3D2E1F0;
+    u32 a2=a,b2=b,c2=c,d2=d,e2=e;
+    auto seg=[&](int F){
+        for (int j=16*F;j<16*F+16;j++) {
+            u32 t = rotl32(a + (F==0?rmd_f<0>(b,c,d):F==1?rmd_f<1>(b,c,d):F==2?rmd_f<2>(b,c,d):F==3?rmd_f<3>(b,c,d):rmd_f<4>(b,c,d)) + X[RMD_R1[j]] + RMD_K1[F], RMD_S1[j]) + e;
+            a=e; e=d; d=rotl32(c,10); c=b; b=t;
+            int G2 = 4-F;
+            u32 t2 = rotl32(a2 + (G2==0?rmd_f<0>(b2,c2,d2):G2==1?rmd_f<1>(b2,c2,d2):G2==2?rmd_f<2>(b2,c2,d2):G2==3?rmd_f<3>(b2,c2,d2):rmd_f<4>(b2,c2,d2)) + X[RMD_R2[j]] + RMD_K2[F], RMD_S2[j]) + e2;
+            a2=e2; e2=d2; d2=rotl32(c2,10); c2=b2; b2=t2;
+        }
+    };
+    seg(0); seg(1); seg(2); seg(3); seg(4);
+    u32 t=0xEFCDAB89u+c+d2;
+    out[1]=0x98BADCFEu+d+e2; out[2]=0x10325476u+e+a2; out[3]=0xC3D2E1F0u+a+b2; out[4]=0x67452301u+b+c2; out[0]=t;
+}
+static void hash160_bytes(const unsigned char* m, size_t n, unsigned char* out20) {
+    unsigned char dg[32]; sha256_bytes(m,n,dg);
+    u32 X[16]={0},o[5];
+    for (int i=0;i<8;i++) X[i]=(u32)dg[4*i]|((u32)dg[4*i+1]<<8)|((u32)dg[4*i+2]<<16)|((u32)dg[4*i+3]<<24);
+    X[8]=0x80; X[14]=256;
+    rmd160_block(X,o);
+    for (int i=0;i<5;i++){ out20[4*i]=o[i]; out20[4*i+1]=o[i]>>8; out20[4*i+2]=o[i]>>16; out20[4*i+3]=o[i]>>24; }
+}
+static U256 pack20(const unsigned char* b) {
+    U256 r=ZERO; memcpy(&r.d[0],b,8); memcpy(&r.d[1],b+8,8); u32 t; memcpy(&t,b+16,4); r.d[2]=t; return r;
+}
+
+#ifdef __CUDACC__
+// =================== Moteur GPU (CUDA) : arithmétique et hachage __device__ ===================
+// Réimplémentation séparée (plutôt que des qualificateurs __host__ __device__ sur les fonctions
+// CPU ci-dessus) : formules RECOPIÉES À L'IDENTIQUE des fonctions CPU correspondantes (mêmes
+// opérations, même ordre), afin de pouvoir se relire en comparant ligne à ligne. Un auto-test
+// dédié (gpu_run_self_test, plus bas) exécute ce code sur un lot de points connus et compare
+// CHAQUE coordonnée et CHAQUE hash160 obtenu à la valeur calculée par le code CPU déjà validé ;
+// un GPU dont l'auto-test échoue est exclu de la recherche (voir main()). Chaque correspondance
+// potentielle remontée par le GPU est de toute façon revérifiée par la fonction CPU verify_key()
+// avant tout enregistrement (voir gpu_worker) : un bug de portage GPU peut donc au pire faire
+// manquer une clé, jamais en enregistrer une fausse.
+//
+// Pas de type u128/__int128 côté device (support historiquement incertain selon les versions de
+// nvcc) : toute l'arithmétique 64x64->128 bits est faite à la main avec __umul64hi() + détection
+// de dépassement sur addition 64 bits, qui sont portables sur toutes les architectures CUDA. Les
+// clés privées (jusqu'à 128 bits) ne sont JAMAIS manipulées côté device : le CPU calcule pour
+// chaque bloc de clés son point de départ sur la courbe (scalar_mul_fixed, déjà testé) et ne
+// transmet au GPU QUE ce point affine plus un nombre de pas ; le GPU ne travaille qu'avec des
+// points et ne reconstitue jamais la clé privée elle-même (le CPU la retrouve ensuite à partir du
+// point de départ connu et du décalage renvoyé par le GPU).
+struct DU256 { u64 d[4]; };
+struct DPoint { DU256 x, y; };
+
+__device__ __forceinline__ DU256 d_zero() { DU256 r; r.d[0]=r.d[1]=r.d[2]=r.d[3]=0; return r; }
+__device__ __forceinline__ DU256 d_one()  { DU256 r; r.d[0]=1; r.d[1]=r.d[2]=r.d[3]=0; return r; }
+__device__ __forceinline__ bool d_is_zero(const DU256&a){ return (a.d[0]|a.d[1]|a.d[2]|a.d[3])==0; }
+__device__ __forceinline__ bool d_eq(const DU256&a,const DU256&b){
+    return ((a.d[0]^b.d[0])|(a.d[1]^b.d[1])|(a.d[2]^b.d[2])|(a.d[3]^b.d[3]))==0;
+}
+// Addition avec retenue d'un seul bit (cin, cout dans {0,1}) : utilisée pour l'addition/
+// soustraction 256 bits (pas de multiplication, donc pas besoin de la version 128 bits ci-dessous).
+__device__ __forceinline__ u64 d_adc(u64 a, u64 b, u64 cin, u64 &cout) {
+    u64 s = a + b; u64 c0 = (s < a) ? 1ull : 0ull;
+    u64 r = s + cin; u64 c1 = (r < s) ? 1ull : 0ull;
+    cout = c0 + c1; // jamais > 1 (preuve : si c0=1 alors s <= 2^64-2 donc r=s+cin ne déborde pas)
+    return r;
+}
+__device__ __forceinline__ u64 d_sbb(u64 a, u64 b, u64 bin, u64 &bout) {
+    u64 s = a - b; u64 b0 = (a < b) ? 1ull : 0ull;
+    u64 r = s - bin; u64 b1 = (s < bin) ? 1ull : 0ull;
+    bout = b0 + b1; // même preuve que d_adc, en soustraction
+    return r;
+}
+__device__ __forceinline__ u64 d_add_raw(DU256 &r, const DU256 &a, const DU256 &b) {
+    u64 c = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) r.d[i] = d_adc(a.d[i], b.d[i], c, c);
+    return c;
+}
+__device__ __forceinline__ u64 d_sub_raw(DU256 &r, const DU256 &a, const DU256 &b) {
+    u64 br = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) r.d[i] = d_sbb(a.d[i], b.d[i], br, br);
+    return br;
+}
+// a*b + add1 + add2 (3 opérandes, résultat 128 bits exact) sans __int128 : lo/hi via multiplication
+// 64x64 native + __umul64hi, puis les deux additions supplémentaires sont accumulées dans lo avec
+// report des retenues (au plus 2, 0/1 chacune) directement dans hi — toujours exact ici car le
+// total (produit 64x64 + deux termes 64 bits) tient par construction sur 128 bits (comme le acc de
+// type u128 qu'il remplace), donc hi ne peut jamais déborder au-delà de 64 bits.
+__device__ __forceinline__ void d_mac(u64 a, u64 b, u64 add1, u64 add2, u64 &lo_out, u64 &hi_out) {
+    u64 lo = a * b, hi = __umul64hi(a, b);
+    u64 lo2 = lo + add1; u64 c1 = (lo2 < lo) ? 1ull : 0ull;
+    u64 lo3 = lo2 + add2; u64 c2 = (lo3 < lo2) ? 1ull : 0ull;
+    lo_out = lo3; hi_out = hi + c1 + c2;
+}
+static const u64 D_KC = 0x1000003D1ULL;
+__device__ __forceinline__ void d_fe_add(DU256 &r, const DU256 &a, const DU256 &b) {
+    DU256 t; u64 c = d_add_raw(t, a, b);
+    if (c) { DU256 k = {{D_KC,0,0,0}}; d_add_raw(t, t, k); }
+    DU256 P = {{0xFFFFFFFEFFFFFC2FULL, ~0ULL, ~0ULL, ~0ULL}};
+    bool geq = true;
+    #pragma unroll
+    for (int i = 3; i >= 0 && geq; --i) if (t.d[i] != P.d[i]) { geq = t.d[i] > P.d[i]; break; }
+    if (geq) d_sub_raw(t, t, P);
+    r = t;
+}
+__device__ __forceinline__ void d_fe_sub(DU256 &r, const DU256 &a, const DU256 &b) {
+    DU256 t; u64 br = d_sub_raw(t, a, b);
+    if (br) { DU256 k = {{D_KC,0,0,0}}; d_sub_raw(t, t, k); }
+    r = t;
+}
+__device__ __forceinline__ void d_fe_reduce(DU256 &r, const u64 *t) {
+    u64 r5[5]; u64 carry = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        u64 lo, hi; d_mac(t[4+i], D_KC, t[i], carry, lo, hi);
+        r5[i] = lo; carry = hi;
+    }
+    r5[4] = carry;
+    DU256 res; u64 lo, hi; d_mac(r5[4], D_KC, r5[0], 0, lo, hi);
+    res.d[0] = lo; carry = hi;
+    #pragma unroll
+    for (int i = 1; i < 4; i++) { u64 s = r5[i] + carry; u64 c = (s < r5[i]) ? 1ull : 0ull; res.d[i] = s; carry = c; }
+    if (carry) {
+        u64 s = res.d[0] + D_KC; u64 c = (s < res.d[0]) ? 1ull : 0ull; res.d[0] = s; carry = c;
+        #pragma unroll
+        for (int i = 1; i < 4; i++) { u64 s2 = res.d[i] + carry; u64 c2 = (s2 < res.d[i]) ? 1ull : 0ull; res.d[i] = s2; carry = c2; }
+    }
+    DU256 P = {{0xFFFFFFFEFFFFFC2FULL, ~0ULL, ~0ULL, ~0ULL}};
+    bool geq = true;
+    #pragma unroll
+    for (int i = 3; i >= 0; --i) if (res.d[i] != P.d[i]) { geq = res.d[i] > P.d[i]; break; }
+    if (geq) d_sub_raw(res, res, P);
+    r = res;
+}
+__device__ __forceinline__ void d_fe_mul(DU256 &r, const DU256 &a, const DU256 &b) {
+    u64 t[8] = {0,0,0,0,0,0,0,0};
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        u64 carry = 0;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) { u64 lo, hi; d_mac(a.d[i], b.d[j], t[i+j], carry, lo, hi); t[i+j] = lo; carry = hi; }
+        t[i+4] = carry;
+    }
+    d_fe_reduce(r, t);
+}
+__device__ __forceinline__ void d_fe_sqr(DU256 &r, const DU256 &a) {
+    u64 t[8] = {0,0,0,0,0,0,0,0};
+    #pragma unroll
+    for (int i = 0; i < 3; i++) {
+        u64 carry = 0;
+        for (int j = i+1; j < 4; j++) { u64 lo, hi; d_mac(a.d[i], a.d[j], t[i+j], carry, lo, hi); t[i+j] = lo; carry = hi; }
+        t[i+4] = carry;
+    }
+    u64 c = 0;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) { u64 v = t[k]; t[k] = (v<<1)|c; c = v>>63; }
+    u64 carry = 0;
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        u64 lo, hi; d_mac(a.d[i], a.d[i], t[2*i], carry, lo, hi); t[2*i] = lo; carry = hi;
+        u64 s = t[2*i+1] + carry; u64 c2 = (s < t[2*i+1]) ? 1ull : 0ull; t[2*i+1] = s; carry = c2;
+    }
+    d_fe_reduce(r, t);
+}
+__device__ __forceinline__ void d_fe_sqr_n(DU256 &r, const DU256 &a, int n) {
+    DU256 t = a; for (int i = 0; i < n; i++) d_fe_sqr(t, t); r = t;
+}
+// Chaîne d'addition identique à fe_inv (CPU) : mêmes exposants, même ordre d'opérations.
+__device__ DU256 d_fe_inv(const DU256 &a) {
+    DU256 x2,x3,x6,x9,x11,x22,x44,x88,x176,x220,x223,t;
+    d_fe_sqr(x2,a); d_fe_mul(x2,x2,a);
+    d_fe_sqr(x3,x2); d_fe_mul(x3,x3,a);
+    d_fe_sqr_n(x6,x3,3); d_fe_mul(x6,x6,x3);
+    d_fe_sqr_n(x9,x6,3); d_fe_mul(x9,x9,x3);
+    d_fe_sqr_n(x11,x9,2); d_fe_mul(x11,x11,x2);
+    d_fe_sqr_n(x22,x11,11); d_fe_mul(x22,x22,x11);
+    d_fe_sqr_n(x44,x22,22); d_fe_mul(x44,x44,x22);
+    d_fe_sqr_n(x88,x44,44); d_fe_mul(x88,x88,x44);
+    d_fe_sqr_n(x176,x88,88); d_fe_mul(x176,x176,x88);
+    d_fe_sqr_n(x220,x176,44); d_fe_mul(x220,x220,x44);
+    d_fe_sqr_n(x223,x220,3); d_fe_mul(x223,x223,x3);
+    d_fe_sqr_n(t,x223,23); d_fe_mul(t,t,x22);
+    d_fe_sqr_n(t,t,5); d_fe_mul(t,t,a);
+    d_fe_sqr_n(t,t,3); d_fe_mul(t,t,x2);
+    d_fe_sqr_n(t,t,2); d_fe_mul(t,t,a);
+    return t;
+}
+// Addition affine pleine (P != Q et P != -Q supposé non dégénéré ; cas dégénérés gérés par
+// l'appelant pour le chemin rapide de gpu_scan_device, comme en CPU dans aff_add()).
+__device__ __forceinline__ DPoint d_aff_add_full(const DPoint &P, const DPoint &Q) {
+    DU256 n, d, l; d_fe_sub(n, Q.y, P.y); d_fe_sub(d, Q.x, P.x); d_fe_mul(l, n, d_fe_inv(d));
+    DPoint R; d_fe_sqr(R.x, l); d_fe_sub(R.x, R.x, P.x); d_fe_sub(R.x, R.x, Q.x);
+    DU256 t; d_fe_sub(t, P.x, R.x); d_fe_mul(R.y, l, t); d_fe_sub(R.y, R.y, P.y);
+    return R;
+}
+
+// ---- SHA-256 + RIPEMD-160 (un seul bloc, scalaire) : copie directe de sha256_block/rmd160_block ----
+__constant__ u32 D_SHA_K[64] = {
+0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2};
+__constant__ unsigned char D_RMD_R1[80]={0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15, 7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
+    3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12, 1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2, 4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13};
+__constant__ unsigned char D_RMD_R2[80]={5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12, 6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
+    15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13, 8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14, 12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11};
+__constant__ unsigned char D_RMD_S1[80]={11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8, 7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,
+    11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5, 11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12, 9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6};
+__constant__ unsigned char D_RMD_S2[80]={8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6, 9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,
+    9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5, 15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8, 8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11};
+__constant__ u32 D_RMD_K1[5]={0x00000000,0x5A827999,0x6ED9EBA1,0x8F1BBCDC,0xA953FD4E};
+__constant__ u32 D_RMD_K2[5]={0x50A28BE6,0x5C4DD124,0x6D703EF3,0x7A6D76E9,0x00000000};
+__device__ __forceinline__ u32 d_rotr32(u32 x,int n){ return (x>>n)|(x<<(32-n)); }
+__device__ __forceinline__ u32 d_rotl32(u32 x,int n){ return (x<<n)|(x>>(32-n)); }
+template<int F> __device__ __forceinline__ u32 d_rmd_f(u32 x,u32 y,u32 z){
+    if(F==0) return x^y^z;
+    if(F==1) return (x&y)|(~x&z);
+    if(F==2) return (x|~y)^z;
+    if(F==3) return (x&z)|(y&~z);
+    return x^(y|~z);
+}
+__device__ __forceinline__ void d_rmd160_block(const u32* X, u32* out) {
+    u32 a=0x67452301,b=0xEFCDAB89,c=0x98BADCFE,d=0x10325476,e=0xC3D2E1F0;
+    u32 a2=a,b2=b,c2=c,d2=d,e2=e;
+    #pragma unroll
+    for (int F = 0; F < 5; F++) {
+        int G2 = 4-F;
+        #pragma unroll
+        for (int jj = 0; jj < 16; jj++) {
+            int j = 16*F+jj;
+            u32 fv = (F==0?d_rmd_f<0>(b,c,d):F==1?d_rmd_f<1>(b,c,d):F==2?d_rmd_f<2>(b,c,d):F==3?d_rmd_f<3>(b,c,d):d_rmd_f<4>(b,c,d));
+            u32 t = d_rotl32(a + fv + X[D_RMD_R1[j]] + D_RMD_K1[F], D_RMD_S1[j]) + e;
+            a=e; e=d; d=d_rotl32(c,10); c=b; b=t;
+            u32 fv2 = (G2==0?d_rmd_f<0>(b2,c2,d2):G2==1?d_rmd_f<1>(b2,c2,d2):G2==2?d_rmd_f<2>(b2,c2,d2):G2==3?d_rmd_f<3>(b2,c2,d2):d_rmd_f<4>(b2,c2,d2));
+            u32 t2 = d_rotl32(a2 + fv2 + X[D_RMD_R2[j]] + D_RMD_K2[F], D_RMD_S2[j]) + e2;
+            a2=e2; e2=d2; d2=d_rotl32(c2,10); c2=b2; b2=t2;
+        }
+    }
+    u32 t=0xEFCDAB89u+c+d2;
+    out[1]=0x98BADCFEu+d+e2; out[2]=0x10325476u+e+a2; out[3]=0xC3D2E1F0u+a+b2; out[4]=0x67452301u+b+c2; out[0]=t;
+}
+// hash160 d'une clé publique compressée (33 octets : préfixe de parité 02/03 + X sur 32 octets)
+// construite directement à partir des limbes de X et de la parité, sans buffer d'octets
+// intermédiaire (même principe que hash160_vec côté CPU, mais pour UNE SEULE clé scalaire).
+__device__ void d_hash160(const DU256 &x, u64 parity, DU256 &out) {
+    u32 Xw[8];
+    Xw[0]=(u32)(x.d[3]>>32); Xw[1]=(u32)x.d[3]; Xw[2]=(u32)(x.d[2]>>32); Xw[3]=(u32)x.d[2];
+    Xw[4]=(u32)(x.d[1]>>32); Xw[5]=(u32)x.d[1]; Xw[6]=(u32)(x.d[0]>>32); Xw[7]=(u32)x.d[0];
+    u32 P = 0x02u + (u32)parity;
+    u32 w[64];
+    w[0] = (P<<24) | (Xw[0]>>8);
+    #pragma unroll
+    for (int i = 1; i < 8; i++) w[i] = (Xw[i-1]<<24) | (Xw[i]>>8);
+    w[8] = (Xw[7]<<24) | 0x00800000u;
+    #pragma unroll
+    for (int i = 9; i < 15; i++) w[i] = 0;
+    w[15] = 264;
+    #pragma unroll
+    for (int i = 16; i < 64; i++) {
+        u32 s0 = d_rotr32(w[i-15],7)^d_rotr32(w[i-15],18)^(w[i-15]>>3);
+        u32 s1 = d_rotr32(w[i-2],17)^d_rotr32(w[i-2],19)^(w[i-2]>>10);
+        w[i] = w[i-16]+s0+w[i-7]+s1;
+    }
+    u32 a=0x6a09e667u,b=0xbb67ae85u,c=0x3c6ef372u,dd=0xa54ff53au,e=0x510e527fu,f=0x9b05688cu,g=0x1f83d9abu,h=0x5be0cd19u;
+    #pragma unroll
+    for (int i = 0; i < 64; i++) {
+        u32 S1=d_rotr32(e,6)^d_rotr32(e,11)^d_rotr32(e,25), ch=(e&f)^(~e&g);
+        u32 t1=h+S1+ch+D_SHA_K[i]+w[i];
+        u32 S0=d_rotr32(a,2)^d_rotr32(a,13)^d_rotr32(a,22), mj=(a&b)^(a&c)^(b&c);
+        u32 t2=S0+mj;
+        h=g; g=f; f=e; e=dd+t1; dd=c; c=b; b=a; a=t1+t2;
+    }
+    u32 H[8];
+    H[0]=a+0x6a09e667u; H[1]=b+0xbb67ae85u; H[2]=c+0x3c6ef372u; H[3]=dd+0xa54ff53au;
+    H[4]=e+0x510e527fu; H[5]=f+0x9b05688cu; H[6]=g+0x1f83d9abu; H[7]=h+0x5be0cd19u;
+    u32 rw[16];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        u32 q=H[i];
+        rw[i]=(q>>24)|((q>>8)&0x0000FF00u)|((q<<8)&0x00FF0000u)|(q<<24);
+    }
+    rw[8]=0x80; for(int i=9;i<14;i++) rw[i]=0; rw[14]=256; rw[15]=0;
+    u32 o[5]; d_rmd160_block(rw, o);
+    out.d[0] = (u64)o[0] | ((u64)o[1]<<32);
+    out.d[1] = (u64)o[2] | ((u64)o[3]<<32);
+    out.d[2] = (u64)o[4];
+    out.d[3] = 0;
+}
+
+// ---- Table de cibles côté device : copie de TargetSet::find() (filtre + comparaison complète) ----
+__device__ __forceinline__ int d_targets_find(const DU256 &x, const DU256* th, int n_targets, const u64* filter) {
+    u64 ix = x.d[0] & 0xFFFFu;
+    if (!((filter[ix>>6] >> (ix&63)) & 1ull)) return -1;
+    for (int i = 0; i < n_targets; ++i) if (d_eq(th[i], x)) return i;
+    return -1;
+}
+
+// ---- Fenêtre ±: version device À SENS UNIQUE (plus petite, HALF_GPU) : voir commentaire en tête
+// de fichier (version 9). Même principe d'inversion par lot que scan_batch côté CPU (UN SEUL
+// fe_inv pour tout un lot de GPU_HALF points), mais sans la ruse ±i (un seul sens de parcours,
+// plus simple à vérifier/porter, la table partagée tenant alors sur GPU_HALF+1 points au lieu de
+// 2*HALF+1 ; le gain d'amortissement de l'inversion reste le même facteur GPU_HALF).
+#ifndef GPU_HALF
+#define GPU_HALF 16
+#endif
+
+struct GpuHit { int job; u64 offset; int target; };
+
+// Résultat d'un job de scan GPU : un bloc de 'n' clés consécutives à partir du point affine
+// 'start' (lui-même déjà calculé par le CPU via scalar_mul_fixed, inchangé). Chaque thread CUDA
+// traite un job entier (voir gpu_scan_kernel) : AUCUNE clé privée n'est manipulée ici, seulement
+// des points et des décalages relatifs au job (reconvertis en clé privée réelle côté CPU, dans
+// gpu_worker, à partir du point de départ connu).
+struct GpuJob { DPoint start; u64 n; };
+
+// Scanne un job complet (jusqu'à 'max_hits' correspondances remontées par job, au-delà la clé
+// correspondante sera simplement absente de ce lancement — voir note dans gpu_worker sur le
+// nombre quasi nul de correspondances réelles attendues).
+__device__ void gpu_scan_device(const DPoint* win /* 1..GPU_HALF, multiples de G */,
+                                 const DPoint &start, u64 n,
+                                 const DU256* target_h, int n_targets, const u64* filter,
+                                 int job_idx, GpuHit* hits, int* hit_count, int max_hits) {
+    if (n == 0) return;
+    DU256 Cx = start.x, Cy = start.y;
+    u64 done = 0;
+    DU256 ONEc = d_one();
+    while (done < n) {
+        u64 w = (n - done < (u64)GPU_HALF) ? (n - done) : (u64)GPU_HALF;
+        bool is_last = (done + w == n);
+        int m = is_last ? (int)w - 1 : (int)w; // additions nécessaires (voir commentaire plus haut)
+
+        // Décalage 0 = point C lui-même : coût nul, toujours une sortie valide.
+        {
+            DU256 h; d_hash160(Cx, Cy.d[0] & 1ull, h);
+            int ti = d_targets_find(h, target_h, n_targets, filter);
+            if (ti >= 0) {
+                int idx = atomicAdd(hit_count, 1);
+                if (idx < max_hits) { hits[idx].job = job_idx; hits[idx].offset = done; hits[idx].target = ti; }
+            }
+        }
+
+        if (m > 0) {
+            DU256 pre[GPU_HALF+1];
+            bool zero_flag[GPU_HALF+1];
+            DU256 acc = ONEc;
+            #pragma unroll
+            for (int i = 1; i <= m; i++) {
+                DU256 d; d_fe_sub(d, win[i-1].x, Cx);
+                if (d_is_zero(d)) { zero_flag[i] = true; d = ONEc; } else zero_flag[i] = false;
+                d_fe_mul(acc, acc, d); pre[i] = acc;
+            }
+            DU256 inv = d_fe_inv(acc);
+            DU256 nextCx = Cx, nextCy = Cy; // reste à Cx/Cy si m==0 (jamais utilisé dans ce cas)
+            for (int i = m; i >= 1; --i) {
+                DU256 invd;
+                if (i > 1) {
+                    d_fe_mul(invd, inv, pre[i-1]);
+                    DU256 d; d_fe_sub(d, win[i-1].x, Cx); if (zero_flag[i]) d = ONEc;
+                    d_fe_mul(inv, inv, d);
+                } else invd = inv;
+                bool is_jump = (i == m) && !is_last;
+                if (zero_flag[i]) {
+                    // Cas dégénéré (x du point de la table == Cx) : probabilité ~2^-256 par essai,
+                    // jamais rencontré en pratique. On saute simplement cette sortie (le filtre
+                    // bloom + la revérification CPU garantissent qu'aucune clé n'est jamais
+                    // faussement acceptée ; au pire ce décalage précis ne serait pas testé).
+                    if (is_jump) { nextCx = Cx; nextCy = Cy; }
+                    continue;
+                }
+                DU256 t, l, x3, y3;
+                d_fe_sub(t, win[i-1].y, Cy); d_fe_mul(l, t, invd);
+                d_fe_sqr(x3, l); d_fe_sub(x3, x3, Cx); d_fe_sub(x3, x3, win[i-1].x);
+                d_fe_sub(t, Cx, x3); d_fe_mul(y3, l, t); d_fe_sub(y3, y3, Cy);
+                if (is_jump) {
+                    nextCx = x3; nextCy = y3;
+                } else {
+                    DU256 h; d_hash160(x3, y3.d[0] & 1ull, h);
+                    int ti = d_targets_find(h, target_h, n_targets, filter);
+                    if (ti >= 0) {
+                        int idx = atomicAdd(hit_count, 1);
+                        if (idx < max_hits) { hits[idx].job = job_idx; hits[idx].offset = done + i; hits[idx].target = ti; }
+                    }
+                }
+            }
+            if (!is_last) { Cx = nextCx; Cy = nextCy; }
+        }
+        done += w;
+    }
+}
+
+__global__ void gpu_scan_kernel(const DPoint* win, const GpuJob* jobs, int n_jobs,
+                                 const DU256* target_h, int n_targets, const u64* filter,
+                                 GpuHit* hits, int* hit_count, int max_hits) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_jobs) return;
+    gpu_scan_device(win, jobs[i].start, jobs[i].n, target_h, n_targets, filter, i, hits, hit_count, max_hits);
+}
+
+// Auto-test GPU : UN SEUL thread parcourt séquentiellement GPU_SELFTEST_N clés à partir de
+// 'start' avec gpu_scan_device (table de cibles vide : seul le calcul point+hash nous intéresse
+// ici), et écrit CHAQUE point (x, parité) et hash160 intermédiaire dans des tableaux de sortie.
+// Le CPU (gpu_run_self_test) recalcule indépendamment les mêmes valeurs avec les fonctions CPU
+// déjà validées (aff_add/hash160_bytes) et compare octet à octet.
+__global__ void gpu_selftest_kernel(const DPoint* win, DPoint start, u64 n,
+                                     DU256* out_x, u64* out_parity, DU256* out_hash) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    DU256 Cx = start.x, Cy = start.y;
+    u64 done = 0;
+    DU256 ONEc = d_one();
+    while (done < n) {
+        u64 w = (n - done < (u64)GPU_HALF) ? (n - done) : (u64)GPU_HALF;
+        bool is_last = (done + w == n);
+        int m = is_last ? (int)w - 1 : (int)w;
+
+        out_x[done] = Cx; out_parity[done] = Cy.d[0] & 1ull;
+        d_hash160(Cx, out_parity[done], out_hash[done]);
+
+        if (m > 0) {
+            DU256 pre[GPU_HALF+1]; bool zero_flag[GPU_HALF+1];
+            DU256 acc = ONEc;
+            for (int i = 1; i <= m; i++) {
+                DU256 d; d_fe_sub(d, win[i-1].x, Cx);
+                if (d_is_zero(d)) { zero_flag[i] = true; d = ONEc; } else zero_flag[i] = false;
+                d_fe_mul(acc, acc, d); pre[i] = acc;
+            }
+            DU256 inv = d_fe_inv(acc);
+            DU256 nextCx = Cx, nextCy = Cy;
+            for (int i = m; i >= 1; --i) {
+                DU256 invd;
+                if (i > 1) {
+                    d_fe_mul(invd, inv, pre[i-1]);
+                    DU256 d; d_fe_sub(d, win[i-1].x, Cx); if (zero_flag[i]) d = ONEc;
+                    d_fe_mul(inv, inv, d);
+                } else invd = inv;
+                bool is_jump = (i == m) && !is_last;
+                if (zero_flag[i]) { if (is_jump) { nextCx = Cx; nextCy = Cy; } continue; }
+                DU256 t, l, x3, y3;
+                d_fe_sub(t, win[i-1].y, Cy); d_fe_mul(l, t, invd);
+                d_fe_sqr(x3, l); d_fe_sub(x3, x3, Cx); d_fe_sub(x3, x3, win[i-1].x);
+                d_fe_sub(t, Cx, x3); d_fe_mul(y3, l, t); d_fe_sub(y3, y3, Cy);
+                if (is_jump) { nextCx = x3; nextCy = y3; }
+                else {
+                    u64 par = y3.d[0] & 1ull;
+                    out_x[done+i] = x3; out_parity[done+i] = par;
+                    d_hash160(x3, par, out_hash[done+i]);
+                }
+            }
+            if (!is_last) { Cx = nextCx; Cy = nextCy; }
+        }
+        done += w;
+    }
+}
+#endif // __CUDACC__
+
+// ---- hash160 vectorisé (8 clés à la fois) : le cœur de l'accélération de ce moteur ----
+#ifndef VLANES
+#define VLANES 8
+#endif
+typedef u32 vu __attribute__((vector_size(4*VLANES)));
+static inline vu vsplat(u32 x){ vu v; for(int i=0;i<VLANES;i++) v[i]=x; return v; }
+#define VROTR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+#define VROTL(x,n) (((x)<<(n))|((x)>>(32-(n))))
+template<int F> static inline vu rmd_fv(vu x,vu y,vu z){
+    if(F==0) return x^y^z;
+    if(F==1) return (x&y)|(~x&z);
+    if(F==2) return (x|~y)^z;
+    if(F==3) return (x&z)|(y&~z);
+    return x^(y|~z);
+}
+template<int F> static inline void rmd_segv(const vu* X,vu& a,vu& b,vu& c,vu& d,vu& e,vu& a2,vu& b2,vu& c2,vu& d2,vu& e2){
+    for (int j=16*F;j<16*F+16;j++) {
+        vu t=VROTL(a+rmd_fv<F>(b,c,d)+X[RMD_R1[j]]+vsplat(RMD_K1[F]),RMD_S1[j])+e;
+        a=e; e=d; d=VROTL(c,10); c=b; b=t;
+        t=VROTL(a2+rmd_fv<4-F>(b2,c2,d2)+X[RMD_R2[j]]+vsplat(RMD_K2[F]),RMD_S2[j])+e2;
+        a2=e2; e2=d2; d2=VROTL(c2,10); c2=b2; b2=t;
+    }
+}
+// hash160 de VLANES clés publiques compressées (xs[l], pars[l]) -> out[l] (empaqueté comme pack20)
+static void hash160_vec(const U256* xs, const u64* pars, U256* out) {
+    u32 Xl[8][VLANES], Pl[VLANES];
+    for (int l=0;l<VLANES;l++) {
+        const U256& x = xs[l];
+        Xl[0][l]=(u32)(x.d[3]>>32); Xl[1][l]=(u32)x.d[3]; Xl[2][l]=(u32)(x.d[2]>>32); Xl[3][l]=(u32)x.d[2];
+        Xl[4][l]=(u32)(x.d[1]>>32); Xl[5][l]=(u32)x.d[1]; Xl[6][l]=(u32)(x.d[0]>>32); Xl[7][l]=(u32)x.d[0];
+        Pl[l]=0x02u+(u32)pars[l];
+    }
+    vu X[8],w[64],H[8],rw[16];
+    for (int i=0;i<8;i++) memcpy(&X[i],Xl[i],sizeof(vu));
+    vu P; memcpy(&P,Pl,sizeof(vu));
+    w[0]=(P<<24)|(X[0]>>8);
+    for (int i=1;i<8;i++) w[i]=(X[i-1]<<24)|(X[i]>>8);
+    w[8]=(X[7]<<24)|vsplat(0x00800000u);
+    for (int i=9;i<15;i++) w[i]=vsplat(0);
+    w[15]=vsplat(264);
+    for (int i=16;i<64;i++) {
+        vu s0=VROTR(w[i-15],7)^VROTR(w[i-15],18)^(w[i-15]>>3);
+        vu s1=VROTR(w[i-2],17)^VROTR(w[i-2],19)^(w[i-2]>>10);
+        w[i]=w[i-16]+s0+w[i-7]+s1;
+    }
+    vu a=vsplat(0x6a09e667u),b=vsplat(0xbb67ae85u),c=vsplat(0x3c6ef372u),d=vsplat(0xa54ff53au);
+    vu e=vsplat(0x510e527fu),f=vsplat(0x9b05688cu),g=vsplat(0x1f83d9abu),h=vsplat(0x5be0cd19u);
+    for (int i=0;i<64;i++) {
+        vu S1=VROTR(e,6)^VROTR(e,11)^VROTR(e,25), ch=(e&f)^(~e&g);
+        vu t1=h+S1+ch+vsplat(SHA_K[i])+w[i];
+        vu S0=VROTR(a,2)^VROTR(a,13)^VROTR(a,22), mj=(a&b)^(a&c)^(b&c);
+        vu t2=S0+mj;
+        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    H[0]=a+vsplat(0x6a09e667u); H[1]=b+vsplat(0xbb67ae85u); H[2]=c+vsplat(0x3c6ef372u); H[3]=d+vsplat(0xa54ff53au);
+    H[4]=e+vsplat(0x510e527fu); H[5]=f+vsplat(0x9b05688cu); H[6]=g+vsplat(0x1f83d9abu); H[7]=h+vsplat(0x5be0cd19u);
+    for (int i=0;i<8;i++) {
+        vu q=H[i];
+        rw[i]=(q>>24)|((q>>8)&vsplat(0x0000FF00u))|((q<<8)&vsplat(0x00FF0000u))|(q<<24);
+    }
+    rw[8]=vsplat(0x80); for(int i=9;i<14;i++) rw[i]=vsplat(0); rw[14]=vsplat(256); rw[15]=vsplat(0);
+    vu a1=vsplat(0x67452301u),b1=vsplat(0xEFCDAB89u),c1=vsplat(0x98BADCFEu),d1=vsplat(0x10325476u),e1=vsplat(0xC3D2E1F0u);
+    vu a2=a1,b2=b1,c2=c1,d2=d1,e2=e1;
+    rmd_segv<0>(rw,a1,b1,c1,d1,e1,a2,b2,c2,d2,e2);
+    rmd_segv<1>(rw,a1,b1,c1,d1,e1,a2,b2,c2,d2,e2);
+    rmd_segv<2>(rw,a1,b1,c1,d1,e1,a2,b2,c2,d2,e2);
+    rmd_segv<3>(rw,a1,b1,c1,d1,e1,a2,b2,c2,d2,e2);
+    rmd_segv<4>(rw,a1,b1,c1,d1,e1,a2,b2,c2,d2,e2);
+    vu o[5];
+    o[0]=vsplat(0xEFCDAB89u)+c1+d2; o[1]=vsplat(0x98BADCFEu)+d1+e2; o[2]=vsplat(0x10325476u)+e1+a2;
+    o[3]=vsplat(0xC3D2E1F0u)+a1+b2; o[4]=vsplat(0x67452301u)+b1+c2;
+    u32 T[5][VLANES];
+    for (int k=0;k<5;k++) memcpy(T[k],&o[k],sizeof(vu));
+    for (int l=0;l<VLANES;l++) {
+        out[l].d[0]=T[0][l]|((u64)T[1][l]<<32); out[l].d[1]=T[2][l]|((u64)T[3][l]<<32);
+        out[l].d[2]=T[4][l]; out[l].d[3]=0;
+    }
+}
+
+// =================== Base58Check (adresse P2PKH) et WIF ===================
+static const char *B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+static bool decode_address(const std::string &addr, unsigned char out[20]) {
+    unsigned char buf[25] = {0};
+    for (char c : addr) {
+        const char *p = c ? strchr(B58, c) : nullptr;
+        if (!p) return false;
+        int carry = p - B58;
+        for (int i = 24; i >= 0; --i) { carry += 58 * buf[i]; buf[i] = carry & 0xFF; carry >>= 8; }
+        if (carry) return false;
+    }
+    unsigned char h[32]; sha256d(buf, 21, h);
+    if (memcmp(h, buf + 21, 4) != 0 || buf[0] != 0x00) return false;
+    memcpy(out, buf + 1, 20);
+    return true;
+}
+static std::string base58_encode(const std::vector<unsigned char> &in) {
+    std::vector<unsigned char> d(in.size() * 138 / 100 + 1, 0);
+    size_t len = 0;
+    for (unsigned char b : in) {
+        int carry = b; size_t i = 0;
+        for (auto it = d.rbegin(); (carry || i < len) && it != d.rend(); ++it, ++i) {
+            carry += 256 * (*it); *it = carry % 58; carry /= 58;
+        }
+        len = i;
+    }
+    auto it = d.begin(); while (it != d.end() && *it == 0) ++it;
+    std::string s(std::count(in.begin(), in.begin() + std::min<size_t>(1, in.size()), 0), '1');
+    for (; it != d.end(); ++it) s += B58[*it];
+    return s;
+}
+static void to_bytes32_priv(u128 k, unsigned char out[32]) {
+    memset(out, 0, 32);
+    for (int i = 31; i >= 16; --i) { out[i] = (unsigned char)(k & 0xFF); k >>= 8; }
+}
+static std::string to_hex(u128 k) {
+    char t[40]; snprintf(t, sizeof t, "%016llx%016llx", (unsigned long long)(k>>64), (unsigned long long)k);
+    std::string s(t); size_t p = s.find_first_not_of('0');
+    return "0x" + (p == std::string::npos ? "0" : s.substr(p));
+}
+// Nombre de bits nécessaires pour représenter v (0 pour v == 0, 1 pour v == 1, etc.).
+static int u128_bitlen(u128 v) {
+    int n = 0;
+    while (v) { ++n; v >>= 1; }
+    return n;
+}
+static uint64_t next_pow2_u64(uint64_t x) {
+    uint64_t p = 1;
+    while (p < x) p <<= 1;
+    return p;
+}
+// Parse une valeur hexadécimale (préfixe "0x"/"0X" optionnel) dans un u128. Retourne false si la
+// chaîne est vide, contient un caractère non hexadécimal, ou dépasse 128 bits (32 chiffres hex).
+static bool parse_u128_hex(const std::string &in, u128 &out) {
+    std::string s = in;
+    if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s = s.substr(2);
+    if (s.empty() || s.size() > 32) return false;
+    u128 v = 0;
+    for (char c : s) {
+        v <<= 4;
+        if (c >= '0' && c <= '9') v |= (u128)(c - '0');
+        else if (c >= 'a' && c <= 'f') v |= (u128)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v |= (u128)(c - 'A' + 10);
+        else return false;
+    }
+    out = v;
+    return true;
+}
+// Parse un argument de plage "début:fin" en hexadécimal. Retourne false si le format est invalide.
+static bool parse_hex_range(const std::string &arg, u128 &lo, u128 &hi) {
+    size_t p = arg.find(':');
+    if (p == std::string::npos) return false;
+    u128 a, b;
+    if (!parse_u128_hex(arg.substr(0, p), a) || !parse_u128_hex(arg.substr(p + 1), b)) return false;
+    lo = std::min(a, b); hi = std::max(a, b);
+    return true;
+}
+static std::string to_wif(u128 k) {
+    std::vector<unsigned char> v(38);
+    v[0] = 0x80; to_bytes32_priv(k, &v[1]); v[33] = 0x01;
+    unsigned char h[32]; sha256d(v.data(), 34, h); memcpy(&v[34], h, 4);
+    return base58_encode(v);
+}
+
+// =================== Moteur de scan ===================
+static std::atomic<bool> g_stop{false}, g_found{false};
+static std::atomic<uint64_t> g_count{0};
+static std::mutex g_mtx, g_file_mtx, g_print_mtx; // g_print_mtx protège stdout (progression vs "CLE TROUVEE")
+
+// Ensemble de cibles (hash160). Un puzzle seul = 1 cible ; -pApB = jusqu'à 80 cibles cherchées
+// simultanément pendant le MÊME balayage de l'intervalle commun. Un filtre binaire de 65536 bits
+// (8 Ko, reste dans le cache L1) indexé par les 16 bits de poids faible du hash160 écarte d'emblée
+// ~99,9 % des clés (80 cibles -> 0,12 % de faux positifs) avant toute comparaison complète.
+static const int MAX_TARGETS = 80;
+struct TargetSet {
+    std::vector<U256> h;           // hash160 empaquetés (pack20)
+    std::vector<std::string> addr; // adresse P2PKH de chaque cible
+    std::vector<int> puzzle;       // numéro de puzzle (0 = adresse libre hors puzzle)
+    u64 filter[1024] = {};
+    void add(const std::string &a, const unsigned char h20[20], int pz) {
+        h.push_back(pack20(h20)); addr.push_back(a); puzzle.push_back(pz);
+        u64 ix = h.back().d[0] & 0xFFFF; filter[ix >> 6] |= 1ULL << (ix & 63);
+    }
+    size_t size() const { return h.size(); }
+    // Indice de la cible égale à x, ou -1.
+    inline int find(const U256 &x) const {
+        u64 ix = x.d[0] & 0xFFFF;
+        if (!((filter[ix >> 6] >> (ix & 63)) & 1)) return -1;
+        for (size_t i = 0; i < h.size(); ++i) if (eq(h[i], x)) return (int)i;
+        return -1;
+    }
+};
+static TargetSet g_ts;
+static std::atomic<bool> g_tfound[MAX_TARGETS]; // cible déjà trouvée (évite les doublons d'enregistrement)
+static std::atomic<int>  g_remaining{0};        // nombre de cibles restant à trouver
+
+static uint64_t g_next = 0, g_nchunks = 0;
+static std::vector<uint64_t> g_cur;
+static const uint64_t IDLE = UINT64_MAX;
+
+static bool claim(unsigned t, uint64_t &idx) {
+    std::lock_guard<std::mutex> l(g_mtx);
+    if (g_next >= g_nchunks) return false;
+    idx = g_next++; g_cur[t] = idx; return true;
+}
+static void release(unsigned t) { std::lock_guard<std::mutex> l(g_mtx); g_cur[t] = IDLE; }
+static uint64_t safe_index() {
+    std::lock_guard<std::mutex> l(g_mtx);
+    uint64_t m = g_next; for (auto c : g_cur) m = std::min(m, c); return m;
+}
+// Variante de claim() pour le moteur GPU : réserve une PLAGE d'indices de chunks (un par thread
+// CUDA du prochain lancement de kernel) au lieu d'un seul. Même sémantique que claim()/release()
+// pour safe_index() : g_cur[t] = début de la plage en cours (plage non encore terminée).
+static bool claim_range(unsigned t, uint64_t want, uint64_t &start_idx, uint64_t &count) {
+    std::lock_guard<std::mutex> l(g_mtx);
+    if (g_next >= g_nchunks) return false;
+    start_idx = g_next;
+    count = std::min<uint64_t>(want, g_nchunks - g_next);
+    g_next += count;
+    g_cur[t] = start_idx;
+    return true;
+}
+
+// Sérialise la coordonnée X en 32 octets big-endian (SEC1).
+static inline void x_to_bytes(const U256 &x, unsigned char out[32]) {
+    for (int i = 0; i < 4; i++) {
+        u64 limb = x.d[3 - i];
+        for (int j = 0; j < 8; j++) out[i*8 + j] = (unsigned char)(limb >> (56 - 8*j));
+    }
+}
+// Sérialise un point affine en clé publique compressée SEC1 (33 octets : préfixe de parité + X).
+static inline void point_to_compressed(const Point &p, unsigned char out[33]) {
+    out[0] = (p.y.d[0] & 1) ? 0x03 : 0x02;
+    x_to_bytes(p.x, out + 1);
+}
+static bool verify_key(u128 k, int ti) {
+    Point p = jac_to_aff(jac_mul(u128_to_U256(k), G));
+    unsigned char comp[33], h[20];
+    point_to_compressed(p, comp);
+    hash160_bytes(comp, 33, h);
+    return eq(pack20(h), g_ts.h[ti]);
+}
+static void save_key(u128 k, int ti) {
+    const std::string &addr = g_ts.addr[ti];
+    int pz = g_ts.puzzle[ti];
+    std::string hex_k = to_hex(k);
+    std::string wif_k = to_wif(k);
+    std::lock_guard<std::mutex> l(g_file_mtx);
+    std::ofstream f("God.txt", std::ios::app);
+    f << "Adresse : " << addr << "\n";
+    if (pz > 0) f << "Puzzle : #" << pz << "\n";
+    f << "Clé privée (hex) : " << hex_k << "\n"
+      << "WIF (compressé)  : " << wif_k << "\n"
+      << "----------------------------------------\n";
+    f.flush();
+    {
+        std::lock_guard<std::mutex> lp(g_print_mtx);
+        printf("\n\n*** CLE TROUVEE ***\n");
+        if (pz > 0) printf("Puzzle           : #%d\n", pz);
+        printf("Adresse          : %s\n", addr.c_str());
+        printf("Cle privee (hex) : %s\n", hex_k.c_str());
+        printf("WIF (compresse)  : %s\n", wif_k.c_str());
+        printf("Enregistree dans God.txt\n");
+        fflush(stdout);
+    }
+}
+// Traite une correspondance signalée par scan_batch : vérifie la clé en recalculant tout depuis
+// zéro, l'enregistre UNE seule fois, et ne déclenche l'arrêt général que quand TOUTES les cibles
+// sont trouvées (g_found == « toutes trouvées »).
+static void handle_hit(u128 k, int ti) {
+    if (!verify_key(k, ti)) return;
+    if (g_tfound[ti].exchange(true)) return; // déjà trouvée (ex: tirage aléatoire qui repasse dessus)
+    save_key(k, ti);
+    if (g_remaining.fetch_sub(1) == 1) { g_found = true; g_stop = true; }
+}
+// Gestionnaire de signal (Ctrl-C / SIGTERM) : ne fait que des opérations async-signal-safe
+// (std::atomic lock-free + write()), jamais de printf/cout/mutex, qui ne sont pas garantis
+// sûrs à appeler depuis un gestionnaire de signal et pourraient bloquer (deadlock) s'il est
+// déclenché pendant que le thread principal tient déjà le verrou d'affichage.
+// 1er Ctrl-C  : demande un arrêt propre (g_stop) — les threads finissent leur segment en cours
+//               (quelques centaines de µs à quelques ms au plus, vérifié très fréquemment) puis
+//               sont rejoints normalement, et le résumé final est affiché.
+// 2e Ctrl-C   : au cas où l'arrêt propre ne répondrait pas (ex: calcul bloqué), sortie immédiate.
+static std::atomic<int> g_signal_count{0};
+static void on_signal(int) {
+    g_stop = true;
+    if (g_signal_count.fetch_add(1) == 0) {
+        static const char msg[] =
+            "\n[Ctrl-C] Arret demande : fin du segment en cours puis sortie propre "
+            "(Ctrl-C a nouveau pour forcer l'arret immediat)...\n";
+        ssize_t r = write(STDOUT_FILENO, msg, sizeof(msg) - 1); (void)r;
+    } else {
+        static const char msg2[] = "\n[Ctrl-C] Arret force.\n";
+        ssize_t r = write(STDOUT_FILENO, msg2, sizeof(msg2) - 1); (void)r;
+        _exit(130);
+    }
+}
+static double g_display_interval = 30.0; // secondes entre deux rafraîchissements de l'affichage (-s T)
+
+// Formate un nombre de clés (ou de clés/s) avec l'unité adaptée : k, M, G, T, P.
+static std::string fmt_keys(double v) {
+    static const char *U[] = {"", "k", "M", "G", "T", "P"};
+    int i = 0;
+    double a = v;
+    while (a >= 1000.0 && i < 5) { a /= 1000.0; ++i; }
+    char b[32];
+    if (i == 0) snprintf(b, sizeof b, "%.0f", a);
+    else snprintf(b, sizeof b, "%.2f %s", a, U[i]);
+    return b;
+}
+static std::string fmt_time(double s) {
+    if (s > 3.15e9) return ">100 ans";
+    char b[64];
+    if (s > 3.15e7) snprintf(b, sizeof b, "%.1f ans", s / 3.15e7);
+    else if (s > 86400) snprintf(b, sizeof b, "%.1f j", s / 86400);
+    else snprintf(b, sizeof b, "%02d:%02d:%02d", (int)s/3600, ((int)s/60)%60, (int)s%60);
+    return b;
+}
+
+// Fragment d'affichage « | trouvées X/N » (vide quand il n'y a qu'une seule cible).
+static std::string fmt_targets() {
+    int n = (int)g_ts.size();
+    if (n <= 1) return "";
+    return " | trouvées " + std::to_string(n - g_remaining.load()) + "/" + std::to_string(n);
+}
+
+// =================== Fenêtre ±i centrée : le cœur de la vitesse ===================
+// Table des multiples 1..HALF du point de pas 'base' (G pour le mode par défaut, un point
+// quelconque pour le mode voisinage), plus le pas vers le lot suivant (2*HALF*base).
+static const int HALF = 512;
+struct WinTable { std::vector<U256> gx, gy; U256 sx, sy; };
+
+static void build_wintable(WinTable &wt, const Point &base) {
+    wt.gx.assign(HALF + 1, ZERO); wt.gy.assign(HALF + 1, ZERO);
+
+    // Accumule 1*base .. HALF*base, plus le point de pas suivant 2*HALF*base, en coordonnées de
+    // Jacobi (jac_madd / jac_dbl : aucune inversion par point), puis convertit tout le lot en
+    // affine avec UNE SEULE inversion (même astuce de lot que scan_batch), au lieu des HALF
+    // inversions individuelles que faisait l'ancienne version via aff_add. C'est ce qui rendait
+    // build_wintable très coûteuse en mode voisinage, où elle est reconstruite à chaque segment.
+    const int M = HALF + 1; // +1 pour le point de pas suivant
+    // Buffers réutilisés d'un appel à l'autre : build_wintable est rappelée à chaque segment en
+    // mode voisinage, donc réallouer 4 vecteurs à chaque appel serait un coût fixe inutile.
+    // Pas de risque de concurrence : build_wintable n'est jamais appelée depuis plusieurs threads
+    // à la fois (une fois au démarrage, sinon séquentiellement depuis la boucle d'essais).
+    static std::vector<U256> X(M + 1), Y(M + 1), Z(M + 1), pre(M + 1); // indices 1..M
+
+    Jac cur; cur.X = base.x; cur.Y = base.y; cur.Z = ONE; cur.inf = false; // 1*base
+    X[1] = cur.X; Y[1] = cur.Y; Z[1] = cur.Z;
+    for (int i = 2; i <= HALF; i++) {
+        cur = jac_madd(cur, base);
+        X[i] = cur.X; Y[i] = cur.Y; Z[i] = cur.Z;
+    }
+    Jac s = jac_dbl(cur); // cur == HALF*base ici, donc s == 2*HALF*base
+    X[M] = s.X; Y[M] = s.Y; Z[M] = s.Z;
+
+    // Inversion de lot : produit préfixe, une seule fe_inv, puis répartition arrière.
+    U256 acc = ONE;
+    for (int i = 1; i <= M; i++) { fe_mul(acc, acc, Z[i]); pre[i] = acc; }
+    U256 inv = fe_inv(acc);
+    for (int i = M; i >= 1; --i) {
+        U256 zi; // 1/Z[i]
+        if (i > 1) { fe_mul(zi, inv, pre[i-1]); fe_mul(inv, inv, Z[i]); }
+        else zi = inv;
+        U256 zi2, zi3, ax, ay;
+        fe_sqr(zi2, zi); fe_mul(zi3, zi2, zi);
+        fe_mul(ax, X[i], zi2); fe_mul(ay, Y[i], zi3);
+        if (i <= HALF) { wt.gx[i] = ax; wt.gy[i] = ay; } else { wt.sx = ax; wt.sy = ay; }
+    }
+}
+
+struct Scratch {
+    std::vector<U256> pre, cx; std::vector<char> zero; std::vector<u64> cpar; std::vector<int> coff;
+    Scratch() : pre(HALF+2), cx(2*HALF+2*VLANES+2), zero(HALF+2), cpar(2*HALF+2*VLANES+2), coff(2*HALF+2*VLANES+2) {}
+};
+
+// Scanne N pas consécutifs à partir du point d'indice 0 'start', le long de la table 'wt'.
+// Appelle on_hit(offset, indice_cible) pour CHAQUE clé dont le hash160 correspond à l'une des
+// cibles de 'ts' (offset = position de la clé par rapport à 'start'), sans interrompre le balayage :
+// indispensable quand plusieurs cibles sont cherchées à la fois. Retourne -1 si le balayage est
+// terminé, -2 s'il a été interrompu par should_stop.
+template <typename StopFn, typename HitFn>
+static int64_t scan_batch(const WinTable &wt, const Point &start, uint64_t N, Scratch &sc,
+                           std::atomic<uint64_t> &counter, const TargetSet &ts,
+                           StopFn should_stop, HitFn on_hit) {
+    Point C = aff_add(start, Point{wt.gx[HALF], wt.gy[HALF], false}); // point d'indice HALF
+    uint64_t done = 0;
+    while (done < N) {
+        if (should_stop()) return -2;
+        uint64_t count = std::min<uint64_t>((uint64_t)(2*HALF), N - done);
+        bool last = count < (uint64_t)(2*HALF);
+        int nc = 0;
+        auto emit = [&](const U256 &x, u64 par, int off) { sc.cx[nc]=x; sc.cpar[nc]=par; sc.coff[nc]=off; nc++; };
+        emit(C.x, C.y.d[0] & 1, 0);
+
+        U256 acc = ONE;
+        for (int i = 1; i <= HALF; i++) {
+            U256 d; fe_sub(d, wt.gx[i], C.x);
+            if (is_zero(d)) { sc.zero[i] = 1; d = ONE; } else sc.zero[i] = 0;
+            fe_mul(acc, acc, d); sc.pre[i] = acc;
+        }
+        U256 dS; fe_sub(dS, wt.sx, C.x);
+        bool zs = is_zero(dS); if (zs) dS = ONE;
+        fe_mul(acc, acc, dS);
+        U256 inv = fe_inv(acc);
+
+        Point Cn{ZERO, ZERO, false};
+        {
+            U256 invd; fe_mul(invd, inv, sc.pre[HALF]); fe_mul(inv, inv, dS);
+            if (!zs && !last) {
+                U256 t, l; fe_sub(t, wt.sy, C.y); fe_mul(l, t, invd);
+                fe_sqr(Cn.x, l); fe_sub(Cn.x, Cn.x, C.x); fe_sub(Cn.x, Cn.x, wt.sx);
+                fe_sub(t, C.x, Cn.x); fe_mul(Cn.y, l, t); fe_sub(Cn.y, Cn.y, C.y);
+            }
+        }
+        for (int i = HALF; i >= 1; --i) {
+            U256 invd;
+            if (i > 1) {
+                fe_mul(invd, inv, sc.pre[i-1]);
+                U256 d; fe_sub(d, wt.gx[i], C.x); if (sc.zero[i]) d = ONE;
+                fe_mul(inv, inv, d);
+            } else invd = inv;
+            if (sc.zero[i]) { // cas dégénéré (rare) : repli sur l'addition affine directe
+                U256 ny; fe_sub(ny, ZERO, wt.gy[i]);
+                Point pm = aff_add(C, Point{wt.gx[i], ny, false});
+                emit(pm.x, pm.y.d[0] & 1, -i);
+                if (i < HALF) { Point pp = aff_add(C, Point{wt.gx[i], wt.gy[i], false}); emit(pp.x, pp.y.d[0] & 1, i); }
+                continue;
+            }
+            U256 t, l, x3, y3;
+            fe_add(t, wt.gy[i], C.y); fe_mul(l, t, invd);
+            fe_sqr(x3, l); fe_sub(x3, x3, C.x); fe_sub(x3, x3, wt.gx[i]);
+            fe_sub(t, x3, C.x); fe_mul(y3, l, t); fe_sub(y3, y3, C.y);
+            emit(x3, y3.d[0] & 1, -i);
+            if (i < HALF) {
+                fe_sub(t, wt.gy[i], C.y); fe_mul(l, t, invd);
+                fe_sqr(x3, l); fe_sub(x3, x3, C.x); fe_sub(x3, x3, wt.gx[i]);
+                fe_sub(t, C.x, x3); fe_mul(y3, l, t); fe_sub(y3, y3, C.y);
+                emit(x3, y3.d[0] & 1, i);
+            }
+        }
+
+        for (int c = 0; c < nc; c += VLANES) {
+            U256 xs[VLANES], hs[VLANES]; u64 ps[VLANES]; int m = std::min((int)VLANES, nc - c);
+            for (int l = 0; l < VLANES; l++) { int idx = c + (l < m ? l : m - 1); xs[l] = sc.cx[idx]; ps[l] = sc.cpar[idx]; }
+            hash160_vec(xs, ps, hs);
+            for (int l = 0; l < m; l++) {
+                int ti = ts.find(hs[l]);
+                if (ti >= 0) on_hit((int64_t)done + HALF + sc.coff[c+l], ti);
+            }
+        }
+        counter.fetch_add(count, std::memory_order_relaxed);
+        done += count;
+        if (last) break;
+        if (zs) C = aff_add(C, Point{wt.sx, wt.sy, false}); else C = Cn;
+    }
+    return -1;
+}
+
+static WinTable g_wt_main; // table construite à partir de G, pour le mode par défaut (pas = 1 clé)
+
+// lo/span délimitent la plage réelle à couvrir (span = fin - début + 1, pas nécessairement une
+// puissance de deux pour une plage personnalisée "début:fin" en hexadécimal). g_nchunks reste une
+// puissance de deux (nécessaire pour que le mélange par 'stride' soit une bijection sans doublon) :
+// certains indices permutés tombent donc au-delà de span (reliquat de l'arrondi à la puissance de
+// deux supérieure) et sont simplement sautés ; le dernier chunk réel, lui, est tronqué à la taille
+// qu'il lui reste dans la plage.
+static void worker(unsigned t, u128 lo, u128 span, int cb, uint64_t stride) {
+    const uint64_t n_full = 1ULL << cb, mask = g_nchunks - 1;
+    uint64_t idx;
+    Scratch sc;
+    while (!g_stop.load(std::memory_order_relaxed) && claim(t, idx)) {
+        u128 offset = (u128)((idx * stride) & mask) << cb;
+        if (offset >= span) { release(t); continue; } // chunk hors plage réelle : rien à scanner
+        uint64_t n = (uint64_t)std::min<u128>((u128)n_full, span - offset);
+        u128 start = lo + offset;
+        Point start_pt = scalar_mul_fixed(u128_to_U256(start));
+        bool finished = true;
+        scan_batch(g_wt_main, start_pt, n, sc, g_count, g_ts, [&]() {
+            if (g_stop.load(std::memory_order_relaxed)) { finished = false; return true; }
+            return false;
+        }, [&](int64_t hit, int ti) { handle_hit(start + (u128)hit, ti); });
+        if (finished) release(t); else return;
+    }
+}
+
+// =================== Moteur GPU (CUDA) : orchestration côté hôte ===================
+// Tout le code qui manipule un type GPU (DPoint, DU256, ...) reste confiné à l'intérieur de
+// #ifdef __CUDACC__ ; les fonctions ci-dessous (gpu_device_count_safe, gpu_select_devices,
+// gpu_worker) existent dans les DEUX cas (CUDA ou non) avec les MÊMES signatures ne référençant
+// que des types déjà connus de main(), afin que main() s'écrive de façon identique dans les deux
+// compilations (g++ : toujours 0 GPU disponible, donc chemin CPU pur inchangé).
+#ifdef __CUDACC__
+static inline DU256 toD(const U256 &x) { DU256 r; r.d[0]=x.d[0]; r.d[1]=x.d[1]; r.d[2]=x.d[2]; r.d[3]=x.d[3]; return r; }
+static inline U256 fromD(const DU256 &x) { U256 r; r.d[0]=x.d[0]; r.d[1]=x.d[1]; r.d[2]=x.d[2]; r.d[3]=x.d[3]; return r; }
+static inline DPoint toDP(const Point &p) { DPoint r; r.x=toD(p.x); r.y=toD(p.y); return r; }
+
+static int gpu_device_count_safe() {
+    int n = 0;
+    cudaError_t e = cudaGetDeviceCount(&n);
+    return (e == cudaSuccess) ? n : 0;
+}
+
+// Table partagée des multiples 1..GPU_HALF d'un point de base arbitraire 'step' (affine),
+// construite UNE FOIS sur CPU (aff_add, déjà testé) puis copiée sur chaque GPU utilisé.
+// Indépendante de g_wt_main (table CPU, HALF=512). step = G pour le mode normal (clés
+// consécutives) ; step = scalar_mul_fixed(2^start_bit) pour un segment du mode voisinage (les
+// clés d'un segment ne diffèrent que par ses N bits, donc sautent de 2^start_bit en 2^start_bit).
+static std::vector<DPoint> build_gpu_win_host(const Point &step) {
+    std::vector<Point> pts(GPU_HALF);
+    Point cur = step; pts[0] = cur;
+    for (int i = 1; i < GPU_HALF; i++) { cur = aff_add(cur, step); pts[i] = cur; }
+    std::vector<DPoint> out(GPU_HALF);
+    for (int i = 0; i < GPU_HALF; i++) out[i] = toDP(pts[i]);
+    return out;
+}
+
+// Auto-test GPU : compare GPU_SELFTEST_N points/hash160 calculés par gpu_selftest_kernel à ceux
+// calculés indépendamment par le CPU (aff_add + hash160_bytes, déjà validés par self_test()).
+// Un GPU qui échoue ce test est exclu de la recherche (voir gpu_select_devices). 'step' est le
+// même point de base que celui utilisé pour construire 'win_host' (voir build_gpu_win_host) :
+// teste donc aussi bien le mode normal (step=G) que le mode voisinage (step=2^start_bit * G).
+//
+// Point de départ du test : surtout PAS 'step' lui-même (1*step) — il coïnciderait exactement
+// avec la première entrée de la table de fenêtre 'win' (elle aussi constituée de multiples de
+// 'step' à partir de 1*step), ce qui déclencherait systématiquement le cas dégénéré (delta nul,
+// cf. gpu_scan_device) dès le premier pas : un faux échec garanti, qui ne dit rien de la justesse
+// du code pour une vraie recherche (où le point de départ provient de scalar_mul_fixed sur un
+// scalaire quelconque, rendant une telle coïncidence négligeable). On part donc d'un point
+// lui-même obtenu via scalar_mul_fixed sur une constante arbitraire (« nothing up my sleeve »),
+// exactement comme le ferait gpu_worker/gpu_neighbor_worker en conditions réelles.
+static const u64 GPU_SELFTEST_N = 8192;
+static const u128 GPU_SELFTEST_SCALAR = ((u128)0x9E3779B97F4A7C15ULL << 64) | 0xF39CC0605CEDC835ULL;
+static bool gpu_run_self_test(int device, const std::vector<DPoint> &win_host, const Point &step) {
+    if (cudaSetDevice(device) != cudaSuccess) return false;
+    DPoint *d_win = nullptr; DU256 *d_x = nullptr, *d_hash = nullptr; u64 *d_par = nullptr;
+    bool ok = true;
+    do {
+        if (cudaMalloc(&d_win, GPU_HALF*sizeof(DPoint)) != cudaSuccess) { ok=false; break; }
+        if (cudaMemcpy(d_win, win_host.data(), GPU_HALF*sizeof(DPoint), cudaMemcpyHostToDevice) != cudaSuccess) { ok=false; break; }
+        if (cudaMalloc(&d_x, GPU_SELFTEST_N*sizeof(DU256)) != cudaSuccess) { ok=false; break; }
+        if (cudaMalloc(&d_par, GPU_SELFTEST_N*sizeof(u64)) != cudaSuccess) { ok=false; break; }
+        if (cudaMalloc(&d_hash, GPU_SELFTEST_N*sizeof(DU256)) != cudaSuccess) { ok=false; break; }
+        Point start_cpu = scalar_mul_fixed(u128_to_U256(GPU_SELFTEST_SCALAR));
+        DPoint start = toDP(start_cpu);
+        gpu_selftest_kernel<<<1,1>>>(d_win, start, GPU_SELFTEST_N, d_x, d_par, d_hash);
+        if (cudaDeviceSynchronize() != cudaSuccess) { ok=false; break; }
+        std::vector<DU256> hx(GPU_SELFTEST_N), hh(GPU_SELFTEST_N);
+        std::vector<u64> hp(GPU_SELFTEST_N);
+        if (cudaMemcpy(hx.data(), d_x, GPU_SELFTEST_N*sizeof(DU256), cudaMemcpyDeviceToHost) != cudaSuccess) { ok=false; break; }
+        if (cudaMemcpy(hp.data(), d_par, GPU_SELFTEST_N*sizeof(u64), cudaMemcpyDeviceToHost) != cudaSuccess) { ok=false; break; }
+        if (cudaMemcpy(hh.data(), d_hash, GPU_SELFTEST_N*sizeof(DU256), cudaMemcpyDeviceToHost) != cudaSuccess) { ok=false; break; }
+
+        Point cur = start_cpu;
+        for (u64 i = 0; i < GPU_SELFTEST_N && ok; i++) {
+            if (i > 0) cur = aff_add(cur, step);
+            if (!eq(fromD(hx[i]), cur.x)) { ok = false; break; }
+            if (hp[i] != (cur.y.d[0] & 1ull)) { ok = false; break; }
+            unsigned char comp[33], h20[20];
+            point_to_compressed(cur, comp); hash160_bytes(comp, 33, h20);
+            if (!eq(fromD(hh[i]), pack20(h20))) { ok = false; break; }
+        }
+    } while (0);
+    if (d_win) cudaFree(d_win); if (d_x) cudaFree(d_x); if (d_par) cudaFree(d_par); if (d_hash) cudaFree(d_hash);
+    return ok;
+}
+
+// Liste des GPU détectés ET ayant réussi l'auto-test (voir gpu_run_self_test) ; un GPU qui échoue
+// est simplement absent de la liste (le CPU, ou les autres GPU, prennent le relais). Teste à la
+// fois un pas « mode normal » (step=G) et un pas « mode voisinage » (step=2^40 * G, représentatif
+// d'un segment réel) : gpu_scan_device/gpu_selftest_kernel ne dépendent mathématiquement pas du
+// point de base utilisé, mais ce double test couvre explicitement les deux usages.
+static std::vector<int> gpu_select_devices() {
+    std::vector<int> good;
+    int n = gpu_device_count_safe();
+    if (n <= 0) return good;
+    std::vector<DPoint> win_g = build_gpu_win_host(G);
+    Point step_nb = scalar_mul_fixed(u128_to_U256((u128)1 << 40));
+    std::vector<DPoint> win_nb = build_gpu_win_host(step_nb);
+    for (int d = 0; d < n; d++) {
+        bool ok1 = gpu_run_self_test(d, win_g, G);
+        bool ok2 = ok1 && gpu_run_self_test(d, win_nb, step_nb);
+        if (ok1 && ok2) good.push_back(d);
+        else std::cerr << "Note : auto-test GPU echoue pour le GPU " << d << " ; il est ignore.\n";
+    }
+    return good;
+}
+
+// Construit les tableaux "plats" de la TargetSet pour upload GPU (hash160 empaquetés + filtre).
+static void build_target_arrays_host(std::vector<DU256> &th, std::vector<u64> &filt) {
+    th.resize(g_ts.size());
+    for (size_t i = 0; i < g_ts.size(); i++) th[i] = toD(g_ts.h[i]);
+    filt.assign(1024, 0);
+    for (int i = 0; i < 1024; i++) filt[i] = g_ts.filter[i];
+}
+
+// Largement supérieur au nombre de correspondances réelles possibles en un seul lancement de
+// kernel (au plus g_ts.size(), <= 80) : marge très confortable, jamais atteinte en pratique.
+static const int GPU_MAX_HITS = 4096;
+
+// Thread hôte piloté par un GPU : revendique des PLAGES de chunks (claim_range), construit les
+// jobs correspondants EXACTEMENT comme worker() le fait chunk par chunk (même calcul d'offset,
+// même scalar_mul_fixed déjà testé), les envoie au GPU, puis revérifie et enregistre chaque
+// correspondance potentielle via handle_hit() (identique au chemin CPU : verify_key() recalcule
+// tout depuis zéro avant tout enregistrement). Note : contrairement au CPU, l'arrêt (Ctrl-C) ne
+// peut être pris en compte qu'entre deux lancements de kernel, pas pendant ; blocks x threads
+// est donc choisi assez petit par défaut (1024 x 128) pour qu'un lancement dure au plus quelques
+// secondes sur un T4.
+static void gpu_worker(unsigned t, int device, u128 lo, u128 span, int cb, uint64_t stride, int blocks, int threads) {
+    if (cudaSetDevice(device) != cudaSuccess) { release(t); return; }
+    std::vector<DPoint> win_host = build_gpu_win_host(G);
+    std::vector<DU256> th; std::vector<u64> filt;
+    build_target_arrays_host(th, filt);
+
+    DPoint *d_win=nullptr; DU256 *d_th=nullptr; u64 *d_filt=nullptr;
+    GpuJob *d_jobs=nullptr; GpuHit *d_hits=nullptr; int *d_hitcount=nullptr;
+    size_t want = (size_t)blocks * (size_t)threads;
+    bool ok = true;
+    ok = ok && cudaMalloc(&d_win, GPU_HALF*sizeof(DPoint)) == cudaSuccess;
+    ok = ok && cudaMemcpy(d_win, win_host.data(), GPU_HALF*sizeof(DPoint), cudaMemcpyHostToDevice) == cudaSuccess;
+    ok = ok && cudaMalloc(&d_th, std::max<size_t>(1,th.size())*sizeof(DU256)) == cudaSuccess;
+    if (ok && !th.empty()) ok = cudaMemcpy(d_th, th.data(), th.size()*sizeof(DU256), cudaMemcpyHostToDevice) == cudaSuccess;
+    ok = ok && cudaMalloc(&d_filt, 1024*sizeof(u64)) == cudaSuccess;
+    ok = ok && cudaMemcpy(d_filt, filt.data(), 1024*sizeof(u64), cudaMemcpyHostToDevice) == cudaSuccess;
+    ok = ok && cudaMalloc(&d_jobs, want*sizeof(GpuJob)) == cudaSuccess;
+    ok = ok && cudaMalloc(&d_hits, GPU_MAX_HITS*sizeof(GpuHit)) == cudaSuccess;
+    ok = ok && cudaMalloc(&d_hitcount, sizeof(int)) == cudaSuccess;
+    if (!ok) {
+        std::cerr << "Erreur : allocation memoire GPU " << device << " echouee ; ce GPU est ignore.\n";
+        if (d_win) cudaFree(d_win); if (d_th) cudaFree(d_th); if (d_filt) cudaFree(d_filt);
+        if (d_jobs) cudaFree(d_jobs); if (d_hits) cudaFree(d_hits); if (d_hitcount) cudaFree(d_hitcount);
+        release(t);
+        return;
+    }
+
+    std::vector<GpuJob> jobs(want);
+    std::vector<u128> job_start_key(want);
+    std::vector<uint64_t> job_n(want);
+    std::vector<GpuHit> hits(GPU_MAX_HITS);
+    const uint64_t n_full = 1ULL << cb, mask = g_nchunks - 1;
+
+    uint64_t start_idx, count;
+    while (!g_stop.load(std::memory_order_relaxed) && claim_range(t, (uint64_t)want, start_idx, count)) {
+        for (uint64_t k = 0; k < count; k++) {
+            uint64_t idx = start_idx + k;
+            u128 offset = (u128)((idx * stride) & mask) << cb;
+            if (offset >= span) { job_n[k] = 0; jobs[k].n = 0; continue; } // chunk hors plage réelle
+            uint64_t n = (uint64_t)std::min<u128>((u128)n_full, span - offset);
+            u128 start = lo + offset;
+            job_start_key[k] = start; job_n[k] = n;
+            Point sp = scalar_mul_fixed(u128_to_U256(start));
+            jobs[k].start = toDP(sp); jobs[k].n = n;
+        }
+        for (uint64_t k = count; k < want; k++) jobs[k].n = 0; // threads CUDA surnuméraires : rien à faire
+
+        cudaMemcpy(d_jobs, jobs.data(), want*sizeof(GpuJob), cudaMemcpyHostToDevice);
+        int zero = 0; cudaMemcpy(d_hitcount, &zero, sizeof(int), cudaMemcpyHostToDevice);
+        gpu_scan_kernel<<<blocks, threads>>>(d_win, d_jobs, (int)want, d_th, (int)th.size(), d_filt, d_hits, d_hitcount, GPU_MAX_HITS);
+        cudaError_t kerr = cudaDeviceSynchronize();
+        if (kerr != cudaSuccess) {
+            std::cerr << "Erreur CUDA (GPU " << device << ") : " << cudaGetErrorString(kerr) << " ; ce GPU est arrete.\n";
+            release(t);
+            break;
+        }
+        int hc = 0; cudaMemcpy(&hc, d_hitcount, sizeof(int), cudaMemcpyDeviceToHost);
+        if (hc > 0) {
+            int ncopy = std::min(hc, GPU_MAX_HITS);
+            cudaMemcpy(hits.data(), d_hits, ncopy*sizeof(GpuHit), cudaMemcpyDeviceToHost);
+            for (int i = 0; i < ncopy; i++) {
+                uint64_t jk = (uint64_t)hits[i].job;
+                if (jk < count) handle_hit(job_start_key[jk] + (u128)hits[i].offset, hits[i].target);
+            }
+        }
+        uint64_t total_n = 0; for (uint64_t k = 0; k < count; k++) total_n += job_n[k];
+        g_count.fetch_add(total_n, std::memory_order_relaxed);
+        release(t);
+        if (g_stop.load(std::memory_order_relaxed)) break;
+    }
+    cudaFree(d_win); cudaFree(d_th); cudaFree(d_filt); cudaFree(d_jobs); cudaFree(d_hits); cudaFree(d_hitcount);
+}
+#else
+static int gpu_device_count_safe() { return 0; }
+static std::vector<int> gpu_select_devices() { return {}; }
+static void gpu_worker(unsigned t, int, u128, u128, int, uint64_t, int, int) { release(t); }
+#endif // __CUDACC__
+
+// =================== Mode voisinage (-v / -vv / -vvv / -vvvv) ===================
+struct Segment { int start_bit; int len; const char *nom; };
+// free_bits = nombre de bits qui varient réellement dans la plage (voir run_neighbor_mode) : pour
+// une plage classique "bits" ([2^(bits-1), 2^bits-1]), free_bits == bits - 1 comme avant ; pour une
+// plage personnalisée "début:fin", free_bits dépend de la largeur réelle de la plage.
+static bool segment_fits(int free_bits, int N) { return N >= 1 && N <= free_bits; }
+static std::vector<Segment> build_segments(int level, int free_bits, int N) {
+    Segment prefix{ free_bits - N, N, "prefixe" };
+    Segment suffix{ 0, N, "suffixe" };
+    Segment middle{ (free_bits - N) / 2, N, "milieu" };
+    switch (level) {
+        case 1: return {prefix};
+        case 2: return {middle};
+        case 3: return {suffix};
+        default: return {prefix, middle, suffix};
+    }
+}
+
+// ---- Ordre de visite des cellules : permutation pseudo-aléatoire SANS DOUBLON ----
+// Le mode voisinage découpe l'intervalle en « cellules » : pour un segment de N bits, une cellule est
+// un motif de (free_bits - N) bits (les bits hors segment) ; l'essai de cette cellule balaie les 2^N
+// clés qui ne diffèrent que par les bits du segment. Les 2^(free_bits-N) cellules d'un segment
+// partitionnent donc l'intervalle ENTIER, sans recouvrement.
+// Pour visiter ces cellules dans un ordre aléatoire mais en SACHANT exactement lesquelles ont déjà
+// été faites, on parcourt les indices 0,1,2,... d'un compteur atomique et on les envoie par une
+// permutation pseudo-aléatoire de [0, 2^k) (réseau de Feistel à clés tirées au hasard à chaque
+// lancement, avec « cycle-walking » pour tomber exactement dans [0, 2^k)). Une permutation est une
+// bijection : aucune cellule n'est jamais refaite, aucune n'est oubliée, et il suffit de retenir le
+// compteur (zéro mémoire, zéro verrou) pour connaître l'état d'avancement et détecter la fin.
+struct CellPerm {
+    static const int ROUNDS = 6;
+    int k = 0, h = 0; u128 total = 1; u64 mask = 0; u64 rk[ROUNDS] = {};
+    static inline u64 mix(u64 z) { // splitmix64
+        z += 0x9E3779B97F4A7C15ULL;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+        return z ^ (z >> 31);
+    }
+    void init(int kk, std::mt19937_64 &g) {
+        k = kk; total = (u128)1 << k; h = (k + 1) / 2;
+        mask = (h >= 64) ? ~0ULL : ((1ULL << h) - 1);
+        for (int r = 0; r < ROUNDS; r++) rk[r] = g();
+    }
+    // x dans [0, 2^k)  ->  image dans [0, 2^k) ; bijective.
+    u128 apply(u128 x) const {
+        if (k == 0) return 0;
+        do { // Feistel sur 2h >= k bits ; on recommence tant que le résultat sort de [0, 2^k) (< 2 tours en moyenne)
+            u64 L = (u64)(x >> h) & mask, R = (u64)x & mask;
+            for (int r = 0; r < ROUNDS; r++) { u64 f = L ^ (mix(R ^ rk[r]) & mask); L = R; R = f; }
+            x = ((u128)L << h) | R;
+        } while (x >= total);
+        return x;
+    }
+};
+// Décalage (par rapport à 'lo') du début de la cellule c pour ce segment : on insère N bits à zéro
+// à la position start_bit dans le motif c de (free_bits - N) bits.
+static inline u128 cell_to_off(u128 c, const Segment &seg) {
+    u128 low = c & (((u128)1 << seg.start_bit) - 1);
+    return ((c >> seg.start_bit) << (seg.start_bit + seg.len)) | low;
+}
+
+static std::atomic<uint64_t> g_nb_next{0};      // prochain indice de cellule à réserver (= essais lancés)
+static std::atomic<bool> g_nb_abandoned{false}; // un thread a quitté un essai en cours (arrêt/Ctrl-C/clé trouvée)
+
+// Corps d'un thread du mode voisinage. Chaque thread réserve l'indice suivant (fetch_add, sans
+// verrou), en déduit sa cellule par la permutation, puis balaie TOUT SEUL les segments de cet essai
+// avant de passer au suivant : les nt threads travaillent sur des essais indépendants en parallèle,
+// donc tous les cœurs restent occupés quelle que soit la taille des segments.
+// Aux niveaux -vvvv (3 segments) le même motif c sert aux trois segments (N bits insérés en préfixe,
+// au milieu puis en suffixe) : chaque type de segment parcourt ainsi lui aussi l'intervalle sans doublon.
+static void neighbor_worker(const CellPerm &perm, u128 total_cells, u128 lo, u128 span,
+                             const std::vector<Segment> &segments, const std::vector<WinTable> &seg_wt) {
+    Scratch sc;
+    auto must_stop = []() { return g_stop.load(std::memory_order_relaxed) || g_found.load(std::memory_order_relaxed); };
+    while (!must_stop()) {
+        uint64_t idx = g_nb_next.fetch_add(1, std::memory_order_relaxed);
+        if ((u128)idx >= total_cells) break; // toutes les cellules ont été réservées : plage épuisée
+        u128 c = perm.apply((u128)idx);
+        bool abandoned = false;
+        for (size_t i = 0; i < segments.size(); ++i) {
+            if (must_stop()) { abandoned = true; break; }
+            const Segment &seg = segments[i];
+            u128 off = cell_to_off(c, seg);
+            if (off >= span) continue; // cellule entièrement hors plage (plage non puissance de 2) : rien à scanner
+            u128 base = lo + off;
+            Point start_pt = scalar_mul_fixed(u128_to_U256(base));
+            uint64_t n = (uint64_t)1 << seg.len;
+            int64_t r = scan_batch(seg_wt[i], start_pt, n, sc, g_count, g_ts, must_stop,
+                                   [&](int64_t hit, int ti) { handle_hit(base + ((u128)hit << seg.start_bit), ti); });
+            if (r == -2) { abandoned = true; break; }
+        }
+        if (abandoned) { g_nb_abandoned = true; break; }
+    }
+}
+
+// ---- Équivalent GPU de neighbor_worker ----
+// Réutilise TEL QUEL le moteur de scan GPU déjà écrit et testé pour le mode normal (GpuJob,
+// GpuHit, gpu_scan_kernel, gpu_scan_device) : un « job » GPU est générique (point de départ +
+// nombre de clés à scanner avec une table de fenêtre donnée), il ne sait pas s'il représente un
+// morceau de plage contiguë (mode normal) ou un segment de voisinage (mode voisinage). Seule la
+// table de fenêtre change : au lieu de multiples de G, on utilise les multiples de
+// 2^start_bit * G propres à chaque segment (seg_gpu_win, une par segment, calculées une seule
+// fois dans run_neighbor_mode). Avec le niveau -vvvv (3 segments), les 3 segments d'un même lot de
+// cellules sont traités par 3 lancements de kernel successifs (un par segment), chacun avec sa
+// propre table de fenêtre.
+#ifdef __CUDACC__
+static void gpu_neighbor_worker(int device, u128 lo, u128 span,
+                                 const std::vector<Segment> &segments,
+                                 const std::vector<std::vector<DPoint>> &seg_win_host,
+                                 const CellPerm &perm, u128 total_cells,
+                                 int blocks, int threads) {
+    if (cudaSetDevice(device) != cudaSuccess) { g_nb_abandoned = true; return; }
+    size_t nseg = segments.size();
+    std::vector<DPoint*> d_win(nseg, nullptr);
+    std::vector<DU256> th; std::vector<u64> filt;
+    build_target_arrays_host(th, filt);
+    DU256 *d_th = nullptr; u64 *d_filt = nullptr;
+    GpuJob *d_jobs = nullptr; GpuHit *d_hits = nullptr; int *d_hitcount = nullptr;
+    size_t want = (size_t)blocks * (size_t)threads;
+
+    bool ok = true;
+    for (size_t s = 0; s < nseg; s++) {
+        ok = ok && cudaMalloc(&d_win[s], GPU_HALF*sizeof(DPoint)) == cudaSuccess;
+        ok = ok && cudaMemcpy(d_win[s], seg_win_host[s].data(), GPU_HALF*sizeof(DPoint), cudaMemcpyHostToDevice) == cudaSuccess;
+    }
+    ok = ok && cudaMalloc(&d_th, std::max<size_t>(1,th.size())*sizeof(DU256)) == cudaSuccess;
+    if (ok && !th.empty()) ok = cudaMemcpy(d_th, th.data(), th.size()*sizeof(DU256), cudaMemcpyHostToDevice) == cudaSuccess;
+    ok = ok && cudaMalloc(&d_filt, 1024*sizeof(u64)) == cudaSuccess;
+    ok = ok && cudaMemcpy(d_filt, filt.data(), 1024*sizeof(u64), cudaMemcpyHostToDevice) == cudaSuccess;
+    ok = ok && cudaMalloc(&d_jobs, want*sizeof(GpuJob)) == cudaSuccess;
+    ok = ok && cudaMalloc(&d_hits, GPU_MAX_HITS*sizeof(GpuHit)) == cudaSuccess;
+    ok = ok && cudaMalloc(&d_hitcount, sizeof(int)) == cudaSuccess;
+
+    if (!ok) {
+        std::cerr << "Erreur : allocation memoire GPU " << device << " echouee (voisinage) ; ce GPU est ignore.\n";
+    } else {
+        std::vector<GpuJob> jobs(want);
+        std::vector<u128> job_base(want);
+        std::vector<GpuHit> hits(GPU_MAX_HITS);
+        auto must_stop = []() { return g_stop.load(std::memory_order_relaxed) || g_found.load(std::memory_order_relaxed); };
+        bool fatal = false;
+        while (!fatal && !must_stop()) {
+            uint64_t start_idx = g_nb_next.fetch_add((uint64_t)want, std::memory_order_relaxed);
+            if ((u128)start_idx >= total_cells) break; // toutes les cellules ont été réservées : plage épuisée
+
+            uint64_t count = (uint64_t)std::min<u128>((u128)want, total_cells - (u128)start_idx);
+            for (size_t s = 0; s < nseg && !fatal; s++) {
+                if (must_stop()) { g_nb_abandoned = true; break; }
+                const Segment &seg = segments[s];
+                uint64_t n_seg = (uint64_t)1 << seg.len;
+                for (uint64_t k = 0; k < count; k++) {
+                    u128 c = perm.apply((u128)(start_idx + k));
+                    u128 off = cell_to_off(c, seg);
+                    if (off >= span) { jobs[k].n = 0; continue; } // cellule hors plage (plage non puissance de 2)
+                    u128 base = lo + off;
+                    job_base[k] = base;
+                    Point sp = scalar_mul_fixed(u128_to_U256(base));
+                    jobs[k].start = toDP(sp); jobs[k].n = n_seg;
+                }
+                for (uint64_t k = count; k < want; k++) jobs[k].n = 0; // threads CUDA surnuméraires
+
+                cudaMemcpy(d_jobs, jobs.data(), want*sizeof(GpuJob), cudaMemcpyHostToDevice);
+                int zero = 0; cudaMemcpy(d_hitcount, &zero, sizeof(int), cudaMemcpyHostToDevice);
+                gpu_scan_kernel<<<blocks, threads>>>(d_win[s], d_jobs, (int)want, d_th, (int)th.size(), d_filt, d_hits, d_hitcount, GPU_MAX_HITS);
+                cudaError_t kerr = cudaDeviceSynchronize();
+                if (kerr != cudaSuccess) {
+                    std::cerr << "Erreur CUDA (GPU " << device << ", voisinage) : " << cudaGetErrorString(kerr) << " ; ce GPU est arrete.\n";
+                    g_nb_abandoned = true; fatal = true; break;
+                }
+                int hc = 0; cudaMemcpy(&hc, d_hitcount, sizeof(int), cudaMemcpyDeviceToHost);
+                if (hc > 0) {
+                    int ncopy = std::min(hc, GPU_MAX_HITS);
+                    cudaMemcpy(hits.data(), d_hits, ncopy*sizeof(GpuHit), cudaMemcpyDeviceToHost);
+                    for (int i = 0; i < ncopy; i++) {
+                        uint64_t jk = (uint64_t)hits[i].job;
+                        if (jk < count && jobs[jk].n > 0)
+                            handle_hit(job_base[jk] + ((u128)hits[i].offset << seg.start_bit), hits[i].target);
+                    }
+                }
+                uint64_t total_n = 0; for (uint64_t k = 0; k < count; k++) if (jobs[k].n > 0) total_n += jobs[k].n;
+                g_count.fetch_add(total_n, std::memory_order_relaxed);
+            }
+        }
+    }
+    for (size_t s = 0; s < nseg; s++) if (d_win[s]) cudaFree(d_win[s]);
+    if (d_th) cudaFree(d_th); if (d_filt) cudaFree(d_filt);
+    if (d_jobs) cudaFree(d_jobs); if (d_hits) cudaFree(d_hits); if (d_hitcount) cudaFree(d_hitcount);
+}
+#else
+static void gpu_neighbor_worker(int, u128, u128, const std::vector<Segment>&,
+                                 const std::vector<std::vector<Point>>&, const CellPerm&, u128, int, int) {}
+#endif // __CUDACC__
+
+// Enveloppe bloquante : construit la table de fenêtre GPU de chaque segment (2^start_bit * G,
+// via scalar_mul_fixed déjà testé) puis lance et attend (join) tous les threads GPU. Cette
+// fonction existe (avec la MÊME signature) dans les deux compilations afin que run_neighbor_mode
+// n'ait jamais à nommer le type DPoint (qui n'existe que sous __CUDACC__) ; la variante non-CUDA
+// ne fait rien (jamais appelée, puisque good_gpus est alors toujours vide).
+#ifdef __CUDACC__
+static void run_neighbor_gpu_blocking(const std::vector<int> &good_gpus, u128 lo, u128 span,
+                                       const std::vector<Segment> &segments, const CellPerm &perm,
+                                       u128 total_cells, int gpu_blocks, int gpu_threads) {
+    std::vector<std::vector<DPoint>> seg_win_host(segments.size());
+    for (size_t i = 0; i < segments.size(); ++i) {
+        Point incPt = scalar_mul_fixed(u128_to_U256((u128)1 << segments[i].start_bit));
+        seg_win_host[i] = build_gpu_win_host(incPt);
+    }
+    std::vector<std::thread> th;
+    for (int d : good_gpus)
+        th.emplace_back(gpu_neighbor_worker, d, lo, span, std::cref(segments), std::cref(seg_win_host),
+                         std::cref(perm), total_cells, gpu_blocks, gpu_threads);
+    for (auto &t : th) t.join();
+}
+#else
+static void run_neighbor_gpu_blocking(const std::vector<int>&, u128, u128, const std::vector<Segment>&,
+                                       const CellPerm&, u128, int, int) {}
+#endif // __CUDACC__
+
+// Retourne true si TOUTES les cellules ont été entièrement scannées (plage épuisée).
+static bool run_neighbor_mode(u128 lo, u128 hi, int level, int N, unsigned nt,
+                               bool force_gpu, bool force_cpu, int gpu_blocks, int gpu_threads) {
+    u128 span = hi - lo + (u128)1;
+    // free_bits : nombre de bits nécessaires pour couvrir [0, span). Pour une plage "bits"
+    // classique (span = 2^(bits-1)), free_bits == bits - 1 exactement comme avant.
+    int free_bits = u128_bitlen(span - (u128)1);
+    if (!segment_fits(free_bits, N)) {
+        std::cerr << "Erreur : " << N << " bits ne tient pas dans cette plage (" << free_bits
+                  << " bit(s) utile(s) au maximum)\n";
+        exit(1);
+    }
+    auto segments = build_segments(level, free_bits, N);
+    for (auto &s : segments)
+        if (!segment_fits(free_bits, s.len)) {
+            std::cerr << "Erreur : le segment '" << s.nom << "' ne tient pas dans la plage.\n";
+            exit(1);
+        }
+    const char *noms[] = {"", "prefixe", "milieu", "suffixe", "prefixe+milieu+suffixe"};
+    int k = free_bits - N;                  // bits du motif d'une cellule
+    const u128 total_cells = (u128)1 << k;  // nombre de cellules par type de segment
+    CellPerm perm;
+    {   // clés de la permutation : différentes à chaque lancement (ordre de visite aléatoire)
+        std::random_device rd;
+        std::mt19937_64 g(((uint64_t)rd() << 32) | rd());
+        perm.init(k, g);
+    }
+    const double total_d = (double)total_cells;
+
+    std::vector<int> good_gpus;
+    if (!force_cpu) {
+        auto t_gpu = std::chrono::steady_clock::now();
+        good_gpus = gpu_select_devices();
+        if (!good_gpus.empty())
+            std::cout << good_gpus.size() << " GPU CUDA detecte(s) et valide(s) par auto-test en "
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_gpu).count() << " s.\n";
+    }
+    if (force_gpu && good_gpus.empty())
+        std::cerr << "Note : aucun GPU CUDA utilisable (binaire compilé sans nvcc, aucun GPU détecté, "
+                     "ou auto-test GPU échoué) ; bascule CPU.\n";
+    bool use_gpu = !good_gpus.empty() && !force_cpu;
+
+    if (use_gpu) {
+        std::cout << "Plage : " << to_hex(lo) << " -> " << to_hex(hi)
+                  << " | GPU : " << good_gpus.size() << " (grille " << gpu_blocks << "x" << gpu_threads << ")"
+                  << " | mode : voisinage " << noms[level] << " (" << N << " bits)"
+                  << " | ordre : aléatoire sans doublon (" << fmt_keys(total_d) << " cellules"
+                  << ", ordre différent à chaque lancement)"
+                  << " | pas de reprise\n";
+    } else {
+        std::cout << "Plage : " << to_hex(lo) << " -> " << to_hex(hi)
+                  << " | threads : " << nt << " | mode : voisinage " << noms[level] << " (" << N << " bits)"
+                  << " | ordre : aléatoire sans doublon (" << fmt_keys(total_d) << " cellules"
+                  << ", ordre différent à chaque lancement)"
+                  << " | pas de reprise | implémentation pure (sans bibliothèque)\n";
+    }
+
+    // Précalcule la table de fenêtre (WinTable) CPU de chaque segment UNE SEULE FOIS (inutile en
+    // mode GPU : run_neighbor_gpu_blocking construit sa propre table, format device, en interne).
+    // Le point d'incrément d'un segment ne dépend que de son start_bit, fixe pour toute la session.
+    std::vector<WinTable> seg_wt;
+    if (!use_gpu) {
+        seg_wt.resize(segments.size());
+        for (size_t i = 0; i < segments.size(); ++i) {
+            Point incPt = scalar_mul_fixed(u128_to_U256((u128)1 << segments[i].start_bit));
+            build_wintable(seg_wt[i], incPt);
+        }
+    }
+
+    g_count = 0;
+    g_nb_next = 0;
+    g_nb_abandoned = false;
+    auto t_start = std::chrono::steady_clock::now();
+    std::atomic<bool> fin{false};
+    std::thread disp([&] {
+        auto t0 = t_start, tl = t0;
+        uint64_t last = 0;
+        int sleep_ms = std::max(50, (int)(g_display_interval * 1000));
+        int step = 0; // 0 : ligne immédiate, 1 : première mesure à 2 s, ensuite : intervalle normal
+        while (!fin) {
+            int wait_ms = step == 0 ? 0 : (step == 1 ? std::min(2000, sleep_ms) : sleep_ms);
+            if (wait_ms > 0) {
+            // attente par petits pas : l'arrêt (Ctrl-C, clé trouvée) reste immédiat
+            auto tw = std::chrono::steady_clock::now();
+            while (!fin && std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count() * 1000 < wait_ms)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            ++step;
+            if (fin) break;
+            auto now = std::chrono::steady_clock::now();
+            double el = std::chrono::duration<double>(now - t0).count();
+            double dt = std::chrono::duration<double>(now - tl).count();
+            uint64_t c = g_count.load();
+            double inst = dt > 0 ? (c - last) / dt : 0;
+            last = c; tl = now;
+            double done = std::min((double)g_nb_next.load(), total_d); // essais lancés (cellules)
+            double avg = el > 0 ? done / el : 0;
+            {
+                std::lock_guard<std::mutex> lp(g_print_mtx);
+                printf("\r\033[K%s clés | %s clés/s | essai %s/%s | %.4f%% | écoulé %s | ETA max %s%s",
+                       fmt_keys((double)c).c_str(), fmt_keys(inst).c_str(),
+                       fmt_keys(done).c_str(), fmt_keys(total_d).c_str(), 100.0 * done / total_d,
+                       fmt_time(el).c_str(), fmt_time(avg > 0 ? (total_d - done) / avg : 1e18).c_str(),
+                       fmt_targets().c_str());
+                fflush(stdout);
+            }
+        }
+    });
+
+    if (use_gpu) {
+        run_neighbor_gpu_blocking(good_gpus, lo, span, segments, perm, total_cells, gpu_blocks, gpu_threads);
+    } else {
+        std::vector<std::thread> th;
+        th.reserve(nt);
+        for (unsigned t = 0; t < nt; ++t)
+            th.emplace_back(neighbor_worker, std::cref(perm), total_cells, lo, span, std::cref(segments), std::cref(seg_wt));
+        for (auto &t : th) t.join();
+    }
+
+    fin = true; disp.join();
+    // Plage épuisée = toutes les cellules réservées ET aucun thread n'a abandonné un essai en cours.
+    bool exhausted = (u128)g_nb_next.load() >= total_cells && !g_nb_abandoned.load();
+    if (exhausted) {
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
+        std::lock_guard<std::mutex> lp(g_print_mtx);
+        printf("\r\033[K%s clés (%llu) | 100.0000%% | écoulé %s%s",
+               fmt_keys((double)g_count.load()).c_str(), (unsigned long long)g_count.load(),
+               fmt_time(el).c_str(), fmt_targets().c_str());
+    }
+    printf("\n");
+    return exhausted;
+}
+
+static bool self_test() {
+    bool ok = true;
+    auto check = [&](bool c, const char *name) { if (!c) { fprintf(stderr, "AUTO-TEST ECHEC : %s\n", name); ok = false; } };
+    U256 ex;
+    parse_hex("C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5", ex);
+    Point g2 = jac_to_aff(jac_mul(U256{{2,0,0,0}}, G));
+    check(eq(g2.x, ex), "2G");
+    parse_hex("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", ex);
+    check(eq(G.x, ex), "G.x");
+    // hash160(G) connu (adresse du puzzle 1 : 1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH)
+    unsigned char wb[20] = {0x75,0x1e,0x76,0xe8,0x19,0x91,0x96,0xd4,0x54,0x94,0x1c,0x45,0xd1,0xb3,0xa3,0x23,0xf1,0x43,0x3b,0xd6};
+    unsigned char comp[33], h[20];
+    point_to_compressed(G, comp);
+    hash160_bytes(comp, 33, h);
+    check(memcmp(h, wb, 20) == 0, "hash160(G)");
+    check(eq(pack20(wb), pack20(h)), "pack20");
+    // scalar_mul_fixed vs jac_mul sur plusieurs valeurs
+    std::mt19937_64 rng(424242);
+    for (int i = 0; i < 8; i++) {
+        u128 k = ((u128)rng() << 64) | rng();
+        k &= (((u128)1 << 80) - 1); if (k == 0) k = 1;
+        Point a = scalar_mul_fixed(u128_to_U256(k));
+        Point b = jac_to_aff(jac_mul(u128_to_U256(k), G));
+        if (!(eq(a.x,b.x) && eq(a.y,b.y))) { check(false, "scalar_mul_fixed"); break; }
+    }
+    // table de fenêtre (HALF) vs jac_mul
+    build_wintable(g_wt_main, G);
+    for (int i : {1, 2, 255, 256, 511, 512}) {
+        Point j = jac_to_aff(jac_mul(U256{{(u64)i,0,0,0}}, G));
+        if (!(eq(j.x, g_wt_main.gx[i]) && eq(j.y, g_wt_main.gy[i]))) { check(false, "table de fenetre"); break; }
+    }
+    // hash160 vectorisé vs hash160_bytes
+    {
+        U256 xs[VLANES], hs[VLANES]; u64 ps[VLANES]; int bad = 0;
+        for (int i = 0; i < VLANES; i++) {
+            u128 k = ((u128)rng() << 64) | rng(); if ((k & (((u128)1<<80)-1)) == 0) k = i + 1;
+            k &= (((u128)1 << 80) - 1); if (k == 0) k = i + 1;
+            Point p = jac_to_aff(jac_mul(u128_to_U256(k), G));
+            xs[i] = p.x; ps[i] = p.y.d[0] & 1;
+        }
+        hash160_vec(xs, ps, hs);
+        for (int i = 0; i < VLANES; i++) {
+            unsigned char cc[33], hh[20];
+            cc[0] = ps[i] ? 0x03 : 0x02;
+            x_to_bytes(xs[i], cc + 1);
+            hash160_bytes(cc, 33, hh);
+            if (!eq(hs[i], pack20(hh))) bad++;
+        }
+        check(bad == 0, "hash160_vec vs hash160_bytes");
+    }
+    // filtre/ensemble de cibles + scan complet multi-cibles : clés 12345 et 9000 dans la fenêtre
+    // [8192, 16383], clé 20000 volontairement hors fenêtre (ne doit PAS être signalée).
+    {
+        TargetSet ts;
+        const int tk[3] = {12345, 9000, 20000};
+        for (int i = 0; i < 3; i++) {
+            Point pk = jac_to_aff(jac_mul(U256{{(u64)tk[i],0,0,0}}, G));
+            unsigned char tgt[20];
+            point_to_compressed(pk, comp);
+            hash160_bytes(comp, 33, tgt);
+            ts.add("test", tgt, 0);
+        }
+        check(ts.find(ts.h[1]) == 1 && ts.find(ZERO) == -1, "TargetSet::find");
+        Scratch sc;
+        std::atomic<uint64_t> tc{0}; // compteur local : ne pollue pas g_count
+        std::vector<std::pair<int64_t,int>> hits;
+        Point start = scalar_mul_fixed(u128_to_U256(8192));
+        scan_batch(g_wt_main, start, 8192, sc, tc, ts, [](){ return false; },
+                   [&](int64_t h, int ti) { hits.push_back({h, ti}); });
+        std::sort(hits.begin(), hits.end());
+        check(hits.size() == 2 && hits[0] == std::make_pair((int64_t)(9000 - 8192), 1)
+                               && hits[1] == std::make_pair((int64_t)(12345 - 8192), 0),
+              "scan_batch multi-cibles");
+        check(tc.load() == 8192, "scan_batch compteur");
+    }
+    return ok;
+}
+
+// ---- Adresses du Bitcoin Puzzle n° 1 à 80 (index 0 = puzzle 1) ----
+// Plage de clés du puzzle P : [2^(P-1), 2^P - 1]
+static const char *PUZZLE_ADDR[80] = {
+    "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", "1CUNEBjYrCn2y1SdiUMohaKUi4wpP326Lb",
+    "19ZewH8Kk1PDbSNdJ97FP4EiCjTRaZMZQA", "1EhqbyUMvvs7BfL8goY6qcPbD6YKfPqb7e",
+    "1E6NuFjCi27W5zoXg8TRdcSRq84zJeBW3k", "1PitScNLyp2HCygzadCh7FveTnfmpPbfp8",
+    "1McVt1vMtCC7yn5b9wgX1833yCcLXzueeC", "1M92tSqNmQLYw33fuBvjmeadirh1ysMBxK",
+    "1CQFwcjw1dwhtkVWBttNLDtqL7ivBonGPV", "1LeBZP5QCwwgXRtmVUvTVrraqPUokyLHqe",
+    "1PgQVLmst3Z314JrQn5TNiys8Hc38TcXJu", "1DBaumZxUkM4qMQRt2LVWyFJq5kDtSZQot",
+    "1Pie8JkxBT6MGPz9Nvi3fsPkr2D8q3GBc1", "1ErZWg5cFCe4Vw5BzgfzB74VNLaXEiEkhk",
+    "1QCbW9HWnwQWiQqVo5exhAnmfqKRrCRsvW", "1BDyrQ6WoF8VN3g9SAS1iKZcPzFfnDVieY",
+    "1HduPEXZRdG26SUT5Yk83mLkPyjnZuJ7Bm", "1GnNTmTVLZiqQfLbAdp9DVdicEnB5GoERE",
+    "1NWmZRpHH4XSPwsW6dsS3nrNWfL1yrJj4w", "1HsMJxNiV7TLxmoF6uJNkydxPFDog4NQum",
+    "14oFNXucftsHiUMY8uctg6N487riuyXs4h", "1CfZWK1QTQE3eS9qn61dQjV89KDjZzfNcv",
+    "1L2GM8eE7mJWLdo3HZS6su1832NX2txaac", "1rSnXMr63jdCuegJFuidJqWxUPV7AtUf7",
+    "15JhYXn6Mx3oF4Y7PcTAv2wVVAuCFFQNiP", "1JVnST957hGztonaWK6FougdtjxzHzRMMg",
+    "128z5d7nN7PkCuX5qoA4Ys6pmxUYnEy86k", "12jbtzBb54r97TCwW3G1gCFoumpckRAPdY",
+    "19EEC52krRUK1RkUAEZmQdjTyHT7Gp1TYT", "1LHtnpd8nU5VHEMkG2TMYYNUjjLc992bps",
+    "1LhE6sCTuGae42Axu1L1ZB7L96yi9irEBE", "1FRoHA9xewq7DjrZ1psWJVeTer8gHRqEvR",
+    "187swFMjz1G54ycVU56B7jZFHFTNVQFDiu", "1PWABE7oUahG2AFFQhhvViQovnCr4rEv7Q",
+    "1PWCx5fovoEaoBowAvF5k91m2Xat9bMgwb", "1Be2UF9NLfyLFbtm3TCbmuocc9N1Kduci1",
+    "14iXhn8bGajVWegZHJ18vJLHhntcpL4dex", "1HBtApAFA9B2YZw3G2YKSMCtb3dVnjuNe2",
+    "122AJhKLEfkFBaGAd84pLp1kfE7xK3GdT8", "1EeAxcprB2PpCnr34VfZdFrkUWuxyiNEFv",
+    "1L5sU9qvJeuwQUdt4y1eiLmquFxKjtHr3E", "1E32GPWgDyeyQac4aJxm9HVoLrrEYPnM4N",
+    "1PiFuqGpG8yGM5v6rNHWS3TjsG6awgEGA1", "1CkR2uS7LmFwc3T2jV8C1BhWb5mQaoxedF",
+    "1NtiLNGegHWE3Mp9g2JPkgx6wUg4TW7bbk", "1F3JRMWudBaj48EhwcHDdpeuy2jwACNxjP",
+    "1Pd8VvT49sHKsmqrQiP61RsVwmXCZ6ay7Z", "1DFYhaB2J9q1LLZJWKTnscPWos9VBqDHzv",
+    "12CiUhYVTTH33w3SPUBqcpMoqnApAV4WCF", "1MEzite4ReNuWaL5Ds17ePKt2dCxWEofwk",
+    "1NpnQyZ7x24ud82b7WiRNvPm6N8bqGQnaS", "15z9c9sVpu6fwNiK7dMAFgMYSK4GqsGZim",
+    "15K1YKJMiJ4fpesTVUcByoz334rHmknxmT", "1KYUv7nSvXx4642TKeuC2SNdTk326uUpFy",
+    "1LzhS3k3e9Ub8i2W1V8xQFdB8n2MYCHPCa", "17aPYR1m6pVAacXg1PTDDU7XafvK1dxvhi",
+    "15c9mPGLku1HuW9LRtBf4jcHVpBUt8txKz", "1Dn8NF8qDyyfHMktmuoQLGyjWmZXgvosXf",
+    "1HAX2n9Uruu9YDt4cqRgYcvtGvZj1rbUyt", "1Kn5h2qpgw9mWE5jKpk8PP4qvvJ1QVy8su",
+    "1AVJKwzs9AskraJLGHAZPiaZcrpDr1U6AB", "1Me6EfpwZK5kQziBwBfvLiHjaPGxCKLoJi",
+    "1NpYjtLira16LfGbGwZJ5JbDPh3ai9bjf4", "16jY7qLJnxb7CHZyqBP8qca9d51gAjyXQN",
+    "18ZMbwUFLMHoZBbfpCjUJQTCMCbktshgpe", "13zb1hQbWVsc2S7ZTZnP2G4undNNpdh5so",
+    "1BY8GQbnueYofwSuFAT3USAhGjPrkxDdW9", "1MVDYgVaSN6iKKEsbzRUAYFrYJadLYZvvZ",
+    "19vkiEajfhuZ8bs8Zu2jgmC6oqZbWqhxhG", "19YZECXj3SxEZMoUeJ1yiPsw8xANe7M7QR",
+    "1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU", "1JTK7s9YVYywfm5XUH7RNhHJH1LshCaRFR",
+    "12VVRNPi4SJqUTsp6FmqDqY5sGosDtysn4", "1FWGcVDK3JGzCC3WtkYetULPszMaK2Jksv",
+    "1J36UjUByGroXcCvmj13U6uwaVv9caEeAt", "1DJh2eHFYQfACPmrvpyWc8MSTYKh7w9eRF",
+    "1Bxk4CQdqL9p22JEtDfdXMsng1XacifUtE", "15qF6X51huDjqTmF9BJgxXdt1xcj46Jmhb",
+    "1ARk8HWJMn8js8tQmGUJeQHjSE7KRkn2t8", "1BCf6rHUW6m3iH2ptsvnjgLruAiPQQepLe",
+};
+
+// Analyse "-pA" ou "-pApB" (A, B = numéros de puzzle). Format strict : -p<chiffres>[p<chiffres>].
+static bool parse_puzzle_arg(const std::string &a, int &pa, int &pb) {
+    size_t i = 2, j = i;
+    while (j < a.size() && isdigit((unsigned char)a[j])) ++j;
+    if (j == i || j - i > 3) return false;
+    pa = atoi(a.substr(i, j - i).c_str());
+    if (j == a.size()) { pb = pa; return true; }
+    if (a[j] != 'p') return false;
+    size_t k = ++j;
+    while (j < a.size() && isdigit((unsigned char)a[j])) ++j;
+    if (j != a.size() || j == k || j - k > 3) return false;
+    pb = atoi(a.substr(k).c_str());
+    return true;
+}
+static void print_usage(const char *prog) {
+    std::cerr << "Usage : " << prog << " -pP | -pApB | <adresse> <bits 1-80 | début:fin en hex> [--seq] [--chunk N] "
+              << "[-vN | -vvN | -vvvN | -vvvvN] [-t N] [-s T] [--gpu | --cpu] [--gpu-blocks N] [--gpu-threads N]\n"
+              << "  -pP             : puzzle numéro P (1-80) : adresse + plage [2^(P-1), 2^P-1] automatiques\n"
+              << "  -pApB           : tous les puzzles de A à B (ex: -p66p70) cherchés EN MÊME TEMPS sur\n"
+              << "                    l'intervalle [2^(A-1), 2^B-1] (le plus petit au plus grand puzzle)\n"
+              << "                    plusieurs -p peuvent être combinés : -p66 -p70p72\n"
+              << "  <bits 1-80>     : plage [2^(bits-1), 2^bits-1]\n"
+              << "  <début:fin>     : plage personnalisée en hexadécimal (ex: 8000000000000000:ffffffffffffffff)\n"
+              << "  -t N : nombre de cœurs à utiliser en mode CPU (par défaut : tous)\n"
+              << "  -s T : rafraîchit l'affichage toutes les T secondes (par défaut : 30)\n"
+              << "  --gpu / --cpu   : force l'utilisation (ou non) du/des GPU CUDA (binaire compilé avec nvcc).\n"
+              << "                    Par défaut : GPU utilisés automatiquement si détectés (y compris en mode -v).\n"
+              << "  --gpu-blocks N, --gpu-threads N : taille de grille CUDA (défauts : 1024 x 128).\n";
+}
+// Message de fin quand toutes les cibles n'ont pas été trouvées.
+static void print_final_summary(bool exhausted, bool lead_nl) {
+    int n = (int)g_ts.size(), left = g_remaining.load(), got = n - left;
+    if (left == 0) return; // chaque clé a déjà été affichée par save_key
+    if (lead_nl) std::cout << "\n";
+    const char *why = exhausted ? "Plage entièrement scannée" : "Interrompu";
+    if (n == 1) std::cout << why << (exhausted ? " : clé non trouvée.\n" : " (aucune clé trouvée).\n");
+    else        std::cout << why << " : " << got << "/" << n << " clé(s) trouvée(s).\n";
+}
+
+int main(int argc, char **argv) {
+    // ---- 1. Extraction des arguments -pP / -pApB (cumulables) ; le reste est traité plus bas ----
+    std::vector<std::string> args(argv + 1, argv + argc), rest;
+    bool puzzle_sel[MAX_TARGETS + 1] = {false};
+    bool puzzle_mode = false;
+    for (const std::string &a : args) {
+        if (a.size() >= 3 && a[0] == '-' && a[1] == 'p' && isdigit((unsigned char)a[2])) {
+            int pa = 0, pb = 0;
+            if (!parse_puzzle_arg(a, pa, pb) || pa < 1 || pa > 80 || pb < 1 || pb > 80) {
+                std::cerr << "Argument puzzle invalide : " << a
+                          << " (attendu -pP ou -pApB avec 1 <= P <= 80, ex: -p66 ou -p66p70)\n";
+                return 1;
+            }
+            if (pa > pb) std::swap(pa, pb);
+            for (int p = pa; p <= pb; ++p) puzzle_sel[p] = true;
+            puzzle_mode = true;
+        } else rest.push_back(a);
+    }
+
+    // ---- 2. Cibles et intervalle ----
+    u128 g_lo = 0, g_hi = 0;
+    bool custom_range = false;
+    int bits = 0;
+    size_t opt_start = 0; // indice, dans 'rest', du premier argument optionnel
+    if (puzzle_mode) {
+        int pmin = 0, pmax = 0;
+        for (int p = 1; p <= 80; ++p) {
+            if (!puzzle_sel[p]) continue;
+            unsigned char h20[20];
+            if (!decode_address(PUZZLE_ADDR[p - 1], h20)) {
+                std::cerr << "Erreur interne : adresse du puzzle #" << p << " invalide (checksum)\n";
+                return 1;
+            }
+            g_ts.add(PUZZLE_ADDR[p - 1], h20, p);
+            if (!pmin) pmin = p;
+            pmax = p;
+        }
+        // Intervalle commun : borne inférieure du plus petit puzzle -> borne supérieure du plus grand.
+        bits = pmax;
+        g_lo = (u128)1 << (pmin - 1);
+        g_hi = ((u128)1 << pmax) - 1;
+        if (g_ts.size() == 1) {
+            std::cout << "Puzzle #" << pmin << " | adresse : " << g_ts.addr[0] << "\n";
+        } else {
+            std::cout << "Puzzles #" << pmin << " à #" << pmax << " (" << g_ts.size() << " cibles) | intervalle commun : "
+                      << to_hex(g_lo) << " -> " << to_hex(g_hi) << "\n";
+            for (size_t i = 0; i < g_ts.size(); ++i)
+                std::cout << "  #" << g_ts.puzzle[i] << " : " << g_ts.addr[i] << "\n";
+        }
+    } else {
+        if (rest.size() < 2) { print_usage(argv[0]); return 1; }
+        const std::string &addr = rest[0], &arg2 = rest[1];
+        opt_start = 2;
+        custom_range = arg2.find(':') != std::string::npos;
+        if (custom_range) {
+            if (!parse_hex_range(arg2, g_lo, g_hi)) {
+                std::cerr << "Plage invalide : " << arg2 << " (attendu début:fin en hexadécimal, "
+                          << "ex: 8000000000000000:ffffffffffffffff)\n";
+                return 1;
+            }
+            if (g_lo == g_hi) {
+                std::cerr << "La plage début:fin doit couvrir au moins 2 clés (début < fin)\n";
+                return 1;
+            }
+            bits = u128_bitlen(g_hi);
+        } else {
+            bits = atoi(arg2.c_str());
+        }
+        if (bits < 1 || bits > 80) {
+            std::cerr << (custom_range ? "La plage début:fin doit tenir sur 80 bits au maximum\n"
+                                        : "bits doit être entre 1 et 80\n");
+            return 1;
+        }
+        unsigned char h20[20];
+        if (!decode_address(addr, h20)) { std::cerr << "Adresse P2PKH invalide (checksum)\n"; return 1; }
+        g_ts.add(addr, h20, 0);
+        if (!custom_range) { g_lo = (u128)1 << (bits - 1); g_hi = ((u128)1 << bits) - 1; }
+    }
+    g_remaining = (int)g_ts.size();
+    for (int i = 0; i < MAX_TARGETS; ++i) g_tfound[i] = false;
+
+    // ---- 3. Options ----
+    int cb = 10;
+    bool seq = false;
+    int neighbor_level = 0, neighbor_bits = 0;
+    unsigned nt_override = 0;
+    bool force_gpu = false, force_cpu = false;
+    int gpu_blocks = 0, gpu_threads = 0; // 0 = valeur par défaut choisie plus bas
+    for (size_t i = opt_start; i < rest.size(); ++i) {
+        const std::string &a = rest[i];
+        if (a == "--seq") { seq = true; }
+        else if (a == "--chunk" && i + 1 < rest.size()) { cb = atoi(rest[++i].c_str()); }
+        else if (a == "-t" && i + 1 < rest.size()) {
+            int v = atoi(rest[++i].c_str());
+            if (v < 1) { std::cerr << "-t doit être suivi d'un nombre de cœurs >= 1\n"; return 1; }
+            nt_override = (unsigned)v;
+        }
+        else if (a == "-s" && i + 1 < rest.size()) {
+            double v = atof(rest[++i].c_str());
+            if (v <= 0) { std::cerr << "-s doit être suivi d'une durée en secondes > 0\n"; return 1; }
+            g_display_interval = v;
+        }
+        else if (a.size() >= 2 && a[0] == '-' && a[1] == 'v') {
+            size_t p = 2; while (p < a.size() && a[p] == 'v') ++p;
+            int level = (int)(p - 1);
+            if (level < 1 || level > 4 || p >= a.size() || !isdigit((unsigned char)a[p])) {
+                std::cerr << "Argument invalide : " << a << " (attendu -vN, -vvN, -vvvN ou -vvvvN)\n";
+                return 1;
+            }
+            neighbor_level = level; neighbor_bits = atoi(a.c_str() + p);
+        }
+        else if (a == "--gpu") { force_gpu = true; }
+        else if (a == "--cpu") { force_cpu = true; }
+        else if (a == "--gpu-blocks" && i + 1 < rest.size()) {
+            int v = atoi(rest[++i].c_str());
+            if (v < 1) { std::cerr << "--gpu-blocks doit être suivi d'un entier >= 1\n"; return 1; }
+            gpu_blocks = v;
+        }
+        else if (a == "--gpu-threads" && i + 1 < rest.size()) {
+            int v = atoi(rest[++i].c_str());
+            if (v < 1 || v > 1024) { std::cerr << "--gpu-threads doit être suivi d'un entier entre 1 et 1024\n"; return 1; }
+            gpu_threads = v;
+        }
+        else std::cerr << "Avertissement : argument ignoré : " << a << "\n";
+    }
+    cb = std::max(0, std::min(cb, bits - 1));
+
+    U256 gx, gy;
+    parse_hex("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", gx);
+    parse_hex("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", gy);
+    G.x = gx; G.y = gy; G.inf = false;
+
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+    unsigned nt = nt_override ? nt_override : std::max(1u, std::thread::hardware_concurrency());
+
+    auto t_init = std::chrono::steady_clock::now();
+    init_gtable(G);
+    build_wintable(g_wt_main, G);
+    if (!self_test()) { std::cerr << "Erreur : auto-test echoue, arret.\n"; return 1; }
+    double dt_init = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_init).count();
+    std::cout << "Tables precalculees (base fixe + fenetre " << HALF << ") et auto-tests OK en "
+              << dt_init << " s | SIMD hash160 : " << VLANES << " voies\n";
+
+    if (gpu_blocks <= 0) gpu_blocks = 1024;
+    if (gpu_threads <= 0) gpu_threads = 128;
+
+    if (neighbor_level > 0) {
+        if (seq || cb != 10)
+            std::cerr << "Note : --seq et --chunk sont ignorés en mode voisinage.\n";
+        bool exhausted = run_neighbor_mode(g_lo, g_hi, neighbor_level, neighbor_bits, nt,
+                                            force_gpu, force_cpu, gpu_blocks, gpu_threads);
+        print_final_summary(exhausted, false);
+        return 0;
+    }
+
+    u128 lo = g_lo;
+    u128 span = g_hi - g_lo + (u128)1; // nombre réel de clés à couvrir (pas forcément une puissance de deux)
+    {
+        // Correctif (bug présent depuis la v23) : le nombre de chunks est stocké dans un uint64_t.
+        // Au-delà de 2^62 chunks (span/2^cb), il débordait silencieusement (ex: puzzle 80 avec
+        // cb=10 -> 2^69 chunks tronqué à 0, donc 1 seul chunk scanné puis « plage entièrement
+        // scannée » à tort). On agrandit alors la taille de chunk pour rester sous 2^62 chunks.
+        int span_bits = u128_bitlen(span - (u128)1);
+        if (span_bits - cb > 62) {
+            cb = span_bits - 62;
+            std::cerr << "Note : intervalle très large, taille de chunk portée à 2^" << cb << ".\n";
+        }
+        u128 chunk_size = (u128)1 << cb;
+        uint64_t nchunks_real = (uint64_t)((span + chunk_size - (u128)1) / chunk_size);
+        g_nchunks = next_pow2_u64(nchunks_real == 0 ? 1 : nchunks_real);
+    }
+
+    std::random_device rd;
+    uint64_t stride = seq ? 1 : ((((uint64_t)rd() << 32) | rd()) | 1);
+
+    std::vector<int> good_gpus; // GPU détectés ET ayant réussi leur auto-test (vide si --cpu)
+    if (!force_cpu) {
+        auto t_gpu = std::chrono::steady_clock::now();
+        good_gpus = gpu_select_devices();
+        if (!good_gpus.empty())
+            std::cout << good_gpus.size() << " GPU CUDA detecte(s) et valide(s) par auto-test en "
+                      << std::chrono::duration<double>(std::chrono::steady_clock::now() - t_gpu).count() << " s.\n";
+    }
+    if (force_gpu && good_gpus.empty())
+        std::cerr << "Note : aucun GPU CUDA utilisable (binaire compilé sans nvcc, aucun GPU détecté, "
+                     "ou auto-test GPU échoué) ; bascule CPU.\n";
+    bool use_gpu = !good_gpus.empty() && !force_cpu;
+    unsigned n_workers = use_gpu ? (unsigned)good_gpus.size() : nt;
+    if (gpu_blocks <= 0) gpu_blocks = 1024;
+    if (gpu_threads <= 0) gpu_threads = 128;
+
+    g_cur.assign(n_workers, IDLE);
+
+    if (use_gpu) {
+        std::cout << "Plage : " << to_hex(lo) << " -> " << to_hex(g_hi)
+                  << " | cibles : " << g_ts.size()
+                  << " | GPU : " << good_gpus.size() << " (grille " << gpu_blocks << "x" << gpu_threads << ")"
+                  << " | mode : " << (seq ? "séquentiel" : "aléatoire sans doublon")
+                  << " | chunk : 2^" << cb << "\n";
+    } else {
+        std::cout << "Plage : " << to_hex(lo) << " -> " << to_hex(g_hi)
+                  << " | cibles : " << g_ts.size()
+                  << " | threads : " << nt << " | mode : " << (seq ? "séquentiel" : "aléatoire sans doublon")
+                  << " | chunk : 2^" << cb << " | implémentation pure (sans bibliothèque)\n";
+    }
+
+    g_count = 0; // l'auto-test ne doit rien laisser dans le compteur
+    std::vector<std::thread> th;
+    if (use_gpu) {
+        for (unsigned i = 0; i < good_gpus.size(); ++i)
+            th.emplace_back(gpu_worker, i, good_gpus[i], lo, span, cb, stride, gpu_blocks, gpu_threads);
+    } else {
+        for (unsigned i = 0; i < nt; ++i) th.emplace_back(worker, i, lo, span, cb, stride);
+    }
+
+    auto t0 = std::chrono::steady_clock::now(), tl = t0;
+    uint64_t last = 0;
+    const double total = (double)span;
+    auto all_idle = [&] {
+        std::lock_guard<std::mutex> l(g_mtx);
+        if (g_next < g_nchunks) return false;
+        for (auto c : g_cur) if (c != IDLE) return false;
+        return true;
+    };
+
+    int sleep_ms = std::max(50, (int)(g_display_interval * 1000));
+    // On attend par petits pas de 50 ms (et non d'un seul bloc de 'sleep_ms', qui peut valoir
+    // jusqu'à 30 s ou plus avec -s) afin qu'un Ctrl-C soit pris en compte quasi immédiatement :
+    // sans ça, g_stop passait bien à true tout de suite (les threads s'arrêtaient vite), mais le
+    // thread principal restait endormi jusqu'à la fin de l'intervalle d'affichage avant de s'en
+    // apercevoir, joindre les threads et rendre la main — ce qui donnait l'impression d'un
+    // programme qui ne répond pas au Ctrl-C.
+    const int poll_ms = 50;
+    int since_print_ms = sleep_ms; // force un premier affichage dès le premier passage
+    while (!g_stop && !all_idle()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(poll_ms));
+        since_print_ms += poll_ms;
+        if (g_stop || all_idle()) break;
+        if (since_print_ms < sleep_ms) continue;
+        since_print_ms = 0;
+        auto now = std::chrono::steady_clock::now();
+        double el = std::chrono::duration<double>(now - t0).count();
+        double dt = std::chrono::duration<double>(now - tl).count();
+        uint64_t c = g_count.load();
+        double inst = (c - last) / dt, avg = c / el;
+        last = c; tl = now;
+        double remaining = total - (double)c;
+        {
+            std::lock_guard<std::mutex> lp(g_print_mtx);
+            printf("\r\033[K%s clés | %s clés/s | %.4f%% | écoulé %s | ETA max %s%s",
+                   fmt_keys((double)c).c_str(), fmt_keys(inst).c_str(), 100.0 * (total - remaining) / total,
+                   fmt_time(el).c_str(), fmt_time(avg > 0 ? remaining / avg : 1e18).c_str(),
+                   fmt_targets().c_str());
+            fflush(stdout);
+        }
+    }
+    g_stop = true;
+    for (auto &t : th) t.join();
+
+    bool exhausted = safe_index() >= g_nchunks;
+    if (exhausted) {
+        // Dernière ligne de progression : sans elle, l'affichage resterait figé sur la dernière
+        // mesure périodique (ex: 92 %) alors que la plage est terminée.
+        double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::lock_guard<std::mutex> lp(g_print_mtx);
+        printf("\r\033[K%s clés (%llu) | 100.0000%% | écoulé %s%s",
+               fmt_keys((double)g_count.load()).c_str(), (unsigned long long)g_count.load(),
+               fmt_time(el).c_str(), fmt_targets().c_str());
+        fflush(stdout);
+    }
+    print_final_summary(exhausted, true);
+}
